@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import get_settings
-from tencent_bot import router as bot_router, mimo, renderer  # ← 新增 renderer
+from tencent_bot import router as bot_router, mimo, renderer, qq_api  # ← 新增 renderer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,6 +32,7 @@ async def lifespan(app: FastAPI):
 
     await mimo.close()
     await renderer.close()  # ← 关闭 Playwright
+    await qq_api.close()
     logger.info("MiMo-Tencent Bot 已关闭")
 
 

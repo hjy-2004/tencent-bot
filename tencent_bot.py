@@ -3,6 +3,7 @@ from filesystem_tools import TOOLS, execute_tool, register_senders, consume_imag
 
 """腾讯 QQ 机器人 — 富媒体版本"""
 
+import asyncio
 import json
 import time
 import logging
@@ -34,6 +35,7 @@ MAX_PROCESSED = 10000
 
 conversation_history: dict[str, list[dict]] = defaultdict(list)
 MAX_HISTORY = 20
+session_locks: dict[str, asyncio.Lock] = {}
 
 SYSTEM_PROMPT = """你是一个部署在QQ平台上的智能助手，由小米 MiMo-V2-Pro 驱动。
 你友好、专业、乐于助人。请用简洁清晰的语言回答用户的问题。
@@ -147,32 +149,32 @@ class QQBotAPI:
         self.base_url = "https://api.sgroup.qq.com"
         self.access_token: Optional[str] = None
         self._token_fetched: bool = False  # 是否已获取过 token
+        self.http_client = httpx.AsyncClient(timeout=30.0)
 
     # ---------- Token 管理 ----------
 
     async def get_access_token(self) -> str:
         """从腾讯服务器获取新的 access_token 并缓存"""
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    "https://bots.qq.com/app/getAppAccessToken",
-                    json={"appId": self.app_id, "clientSecret": self.app_secret},
-                )
-                if resp.status_code != 200:
-                    logger.error(f"获取 token 失败 {resp.status_code}: {resp.text}")
-                    raise Exception(f"Token 获取失败: {resp.text}")
+            resp = await self.http_client.post(
+                "https://bots.qq.com/app/getAppAccessToken",
+                json={"appId": self.app_id, "clientSecret": self.app_secret},
+            )
+            if resp.status_code != 200:
+                logger.error(f"获取 token 失败 {resp.status_code}: {resp.text}")
+                raise Exception(f"Token 获取失败: {resp.text}")
 
-                data = resp.json()
-                token = data.get("access_token", "")
-                expires_in = int(data.get("expires_in", 7200))
+            data = resp.json()
+            token = data.get("access_token", "")
+            expires_in = int(data.get("expires_in", 7200))
 
-                if not token:
-                    raise Exception("获取的 access_token 为空")
+            if not token:
+                raise Exception("获取的 access_token 为空")
 
-                self.access_token = token
-                self._token_fetched = True
-                logger.info(f"Token 已更新并缓存 (expires_in={expires_in}s)")
-                return self.access_token
+            self.access_token = token
+            self._token_fetched = True
+            logger.info(f"Token 已更新并缓存 (expires_in={expires_in}s)")
+            return self.access_token
         except Exception as e:
             logger.error(f"获取 token 异常: {e}", exc_info=True)
             raise
@@ -208,39 +210,38 @@ class QQBotAPI:
     ) -> dict:
         await self._ensure_token()
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            url = f"{self.base_url}{path}"
+        url = f"{self.base_url}{path}"
 
-            def make_headers():
-                h = {"Authorization": f"QQBot {self.access_token}"}
-                if not files:
-                    h["Content-Type"] = "application/json"
-                return h
+        def make_headers():
+            h = {"Authorization": f"QQBot {self.access_token}"}
+            if not files:
+                h["Content-Type"] = "application/json"
+            return h
 
-            async def do_request(headers):
-                if method == "POST":
-                    return await client.post(
-                        url, headers=headers,
-                        json=json_data, data=data, files=files,
-                    )
-                return await client.get(url, headers=headers)
+        async def do_request(headers):
+            if method == "POST":
+                return await self.http_client.post(
+                    url, headers=headers,
+                    json=json_data, data=data, files=files,
+                )
+            return await self.http_client.get(url, headers=headers)
 
+        resp = await do_request(make_headers())
+
+        # ★ 核心：只有 QQ API 返回 401 时才刷新 token 并重试
+        if self._is_token_error(resp):
+            logger.warning(f"Token 失效 ({resp.status_code})，刷新后重试...")
+            await self.get_access_token()
             resp = await do_request(make_headers())
-
-            # ★ 核心：只有 QQ API 返回 401 时才刷新 token 并重试
-            if self._is_token_error(resp):
-                logger.warning(f"Token 失效 ({resp.status_code})，刷新后重试...")
-                await self.get_access_token()
-                resp = await do_request(make_headers())
-                if resp.status_code >= 400:
-                    logger.error(f"重试后仍然失败 {resp.status_code}: {resp.text}")
-                    return {"status_code": resp.status_code, "error": resp.text}
-
             if resp.status_code >= 400:
-                logger.warning(f"QQ API {method} {path} 返回 {resp.status_code}: {resp.text[:500]}")
+                logger.error(f"重试后仍然失败 {resp.status_code}: {resp.text}")
                 return {"status_code": resp.status_code, "error": resp.text}
-            logger.debug(f"QQ API {method} {path} -> {resp.status_code}")
-            return resp.json() if resp.text else {"status_code": resp.status_code}
+
+        if resp.status_code >= 400:
+            logger.warning(f"QQ API {method} {path} 返回 {resp.status_code}: {resp.text[:500]}")
+            return {"status_code": resp.status_code, "error": resp.text}
+        logger.debug(f"QQ API {method} {path} -> {resp.status_code}")
+        return resp.json() if resp.text else {"status_code": resp.status_code}
 
     # ---------- 文件上传（也用同样的逻辑）----------
 
@@ -266,15 +267,14 @@ class QQBotAPI:
             }
 
             async def do_upload(token: str):
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    return await client.post(
-                        url,
-                        headers={
-                            "Authorization": f"QQBot {token}",
-                            "Content-Type": "application/json",
-                        },
-                        json=payload,
-                    )
+                return await self.http_client.post(
+                    url,
+                    headers={
+                        "Authorization": f"QQBot {token}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
 
             resp = await do_upload(self.access_token)
 
@@ -394,6 +394,9 @@ class QQBotAPI:
         if msg_id:
             payload["msg_id"] = msg_id
         return await self._request("POST", f"/v2/groups/{group_openid}/messages", payload)
+
+    async def close(self):
+        await self.http_client.aclose()
 
 
 
@@ -1015,6 +1018,16 @@ async def _process_and_reply(
     await send_text_fn(reply, msg_id)
 
 
+async def _run_session_serialized(session_key: str, task_coro):
+    lock = session_locks.get(session_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        session_locks[session_key] = lock
+
+    async with lock:
+        await task_coro
+
+
 async def handle_c2c_message(event_data: dict):
     """处理 C2C 私聊消息"""
     content = event_data.get("content", "").strip()
@@ -1041,14 +1054,17 @@ async def handle_c2c_message(event_data: dict):
         send_text =lambda t,   mid: qq_api.send_c2c_message(user_openid, t, mid),
         default_msg_id=msg_id,
     )
-    await _process_and_reply(
-        text=text,
-        session_key=session_key,
-        send_text_fn=lambda t, mid=msg_id: qq_api.send_c2c_message(user_openid, t, mid),
-        send_image_fn=lambda data, cap, mid=msg_id: qq_api.send_c2c_image(user_openid, data, cap, mid),
-        send_card_fn=lambda title, fields, mid=msg_id: qq_api.send_c2c_card(user_openid, title, fields, mid),
-        send_markdown_fn=lambda md, mid=msg_id: qq_api.send_c2c_markdown(user_openid, md, mid),
-        msg_id=msg_id,
+    await _run_session_serialized(
+        session_key,
+        _process_and_reply(
+            text=text,
+            session_key=session_key,
+            send_text_fn=lambda t, mid=msg_id: qq_api.send_c2c_message(user_openid, t, mid),
+            send_image_fn=lambda data, cap, mid=msg_id: qq_api.send_c2c_image(user_openid, data, cap, mid),
+            send_card_fn=lambda title, fields, mid=msg_id: qq_api.send_c2c_card(user_openid, title, fields, mid),
+            send_markdown_fn=lambda md, mid=msg_id: qq_api.send_c2c_markdown(user_openid, md, mid),
+            msg_id=msg_id,
+        ),
     )
 
 
@@ -1076,14 +1092,17 @@ async def handle_group_at_message(event_data: dict):
         send_text =lambda t,   mid: qq_api.send_group_message(group_openid, t, mid),
         default_msg_id=msg_id,
     )
-    await _process_and_reply(
-        text=text,
-        session_key=session_key,
-        send_text_fn=lambda t, mid=msg_id: qq_api.send_group_message(group_openid, t, mid),
-        send_image_fn=lambda data, cap, mid=msg_id: qq_api.send_group_image(group_openid, data, cap, mid),
-        send_card_fn=lambda title, fields, mid=msg_id: qq_api.send_group_card(group_openid, title, fields, mid),
-        send_markdown_fn=lambda md, mid=msg_id: qq_api.send_group_markdown(group_openid, md, mid),
-        msg_id=msg_id,
+    await _run_session_serialized(
+        session_key,
+        _process_and_reply(
+            text=text,
+            session_key=session_key,
+            send_text_fn=lambda t, mid=msg_id: qq_api.send_group_message(group_openid, t, mid),
+            send_image_fn=lambda data, cap, mid=msg_id: qq_api.send_group_image(group_openid, data, cap, mid),
+            send_card_fn=lambda title, fields, mid=msg_id: qq_api.send_group_card(group_openid, title, fields, mid),
+            send_markdown_fn=lambda md, mid=msg_id: qq_api.send_group_markdown(group_openid, md, mid),
+            msg_id=msg_id,
+        ),
     )
 
 
@@ -1112,13 +1131,16 @@ async def handle_direct_message(event_data: dict):
         send_text =lambda t,   mid: qq_api.send_c2c_message(user_openid, t, mid),
         default_msg_id=msg_id,
     )
-    await _process_and_reply(
-        text=text,
-        session_key=session_key,
-        send_text_fn=lambda t, mid=msg_id: qq_api.send_c2c_message(user_openid, t, mid),
-        send_image_fn=lambda data, cap, mid=msg_id: qq_api.send_c2c_image(user_openid, data, cap, mid),
-        send_markdown_fn=lambda md, mid=msg_id: qq_api.send_c2c_markdown(user_openid, md, mid),
-        msg_id=msg_id,
+    await _run_session_serialized(
+        session_key,
+        _process_and_reply(
+            text=text,
+            session_key=session_key,
+            send_text_fn=lambda t, mid=msg_id: qq_api.send_c2c_message(user_openid, t, mid),
+            send_image_fn=lambda data, cap, mid=msg_id: qq_api.send_c2c_image(user_openid, data, cap, mid),
+            send_markdown_fn=lambda md, mid=msg_id: qq_api.send_c2c_markdown(user_openid, md, mid),
+            msg_id=msg_id,
+        ),
     )
 
 
@@ -1146,15 +1168,32 @@ async def handle_at_message(event_data: dict):
         send_text =lambda t,   mid: qq_api.send_channel_message(channel_id, t, mid),
         default_msg_id=msg_id,
     )
-    await _process_and_reply(
-        text=text,
-        session_key=session_key,
-        send_text_fn=lambda t, mid=msg_id: qq_api.send_channel_message(channel_id, t, mid),
-        send_image_fn=lambda data, cap, mid=msg_id: qq_api.send_c2c_image(author_id, data, cap, mid),
-        send_markdown_fn=lambda md, mid=msg_id: qq_api.send_channel_message(channel_id, md, mid),
-        msg_id=msg_id,
+    await _run_session_serialized(
+        session_key,
+        _process_and_reply(
+            text=text,
+            session_key=session_key,
+            send_text_fn=lambda t, mid=msg_id: qq_api.send_channel_message(channel_id, t, mid),
+            send_image_fn=lambda data, cap, mid=msg_id: qq_api.send_c2c_image(author_id, data, cap, mid),
+            send_markdown_fn=lambda md, mid=msg_id: qq_api.send_channel_message(channel_id, md, mid),
+            msg_id=msg_id,
+        ),
     )
 
+
+
+async def _dispatch_event(event_name: str, event_data: dict):
+    try:
+        if event_name == "C2C_MESSAGE_CREATE":
+            await handle_c2c_message(event_data)
+        elif event_name == "DIRECT_MESSAGE_CREATE":
+            await handle_direct_message(event_data)
+        elif event_name == "AT_MESSAGE_CREATE":
+            await handle_at_message(event_data)
+        elif event_name == "GROUP_AT_MESSAGE_CREATE":
+            await handle_group_at_message(event_data)
+    except Exception as e:
+        logger.error(f"异步事件处理失败 {event_name}: {e}", exc_info=True)
 
 
 # ==================== Webhook 路由 ====================
@@ -1163,7 +1202,7 @@ async def handle_at_message(event_data: dict):
 async def webhook_handler(request: Request):
     try:
         body = await request.json()
-        print(f"\n========== 收到事件: {json.dumps(body, ensure_ascii=False)} ==========\n")
+        logger.debug("收到事件: %s", json.dumps(body, ensure_ascii=False))
 
         event = WebhookPayload(**body)
 
@@ -1175,21 +1214,15 @@ async def webhook_handler(request: Request):
             event_ts = d.get("event_ts", "")
             signature = generate_signature(settings.tencent_app_secret, event_ts, plain_token)
             result = {"plain_token": plain_token, "signature": signature}
-            print(f"验证响应: {json.dumps(result)}")
+            logger.debug("验证响应: %s", json.dumps(result, ensure_ascii=False))
             return JSONResponse(content=result)
 
-        # op=0: 事件分发
+        # op=0: 事件分发（快速 ACK + 后台处理）
         event_name = event.t or ""
         event_data = event.d or {}
 
-        if event_name == "C2C_MESSAGE_CREATE":
-            await handle_c2c_message(event_data)
-        elif event_name == "DIRECT_MESSAGE_CREATE":
-            await handle_direct_message(event_data)
-        elif event_name == "AT_MESSAGE_CREATE":
-            await handle_at_message(event_data)
-        elif event_name == "GROUP_AT_MESSAGE_CREATE":
-            await handle_group_at_message(event_data)
+        if event.op == 0 and event_name:
+            asyncio.create_task(_dispatch_event(event_name, event_data))
 
         return JSONResponse(content={"op": 0})
 

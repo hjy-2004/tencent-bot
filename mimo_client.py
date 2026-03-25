@@ -14,8 +14,8 @@ from config import get_settings
 logger = logging.getLogger(__name__)
 
 # 压缩配置
-COMPACT_THRESHOLD = 12   # 超过 12 条消息就压缩（降低阈值，早压缩防止上下文爆炸）
-KEEP_RECENT = 5          # 保留最近 5 条不压缩
+COMPACT_THRESHOLD = 24   # 超过 24 条消息才压缩，减少额外摘要请求
+KEEP_RECENT = 8          # 保留最近 8 条不压缩
 
 
 class MiMoClient:
@@ -44,6 +44,10 @@ class MiMoClient:
             api_key=self.glm_api_key,
             base_url=self.glm_api_base,
         ) if self.glm_api_key else None
+        self.image_client = AsyncOpenAI(
+            api_key=self.image_api_key,
+            base_url=self.image_api_base,
+        ) if self.image_api_key else None
 
     def _use_glm_text(self) -> bool:
         return bool(self.glm_api_key)
@@ -330,17 +334,12 @@ class MiMoClient:
 
     async def generate_image(self, prompt: str) -> Optional[bytes]:
         """调用第三方文生图接口，返回第一张图片字节"""
-        if not self.image_api_key:
+        if not self.image_client:
             logger.error("IMAGE_API_KEY 未配置")
             return None
 
-        image_client = AsyncOpenAI(
-            api_key=self.image_api_key,
-            base_url=self.image_api_base,
-        )
-
         try:
-            response = await image_client.images.generate(
+            response = await self.image_client.images.generate(
                 model=self.image_model,
                 prompt=prompt,
                 extra_body={
@@ -370,8 +369,6 @@ class MiMoClient:
         except Exception as e:
             logger.error(f"文生图调用失败: {e}", exc_info=True)
             return None
-        finally:
-            await image_client.close()
 
     # ──────────────────────────────────────────────
     #  图片 HTML 生成
@@ -444,3 +441,5 @@ class MiMoClient:
         await self.client.close()
         if self.glm_client:
             await self.glm_client.close()
+        if self.image_client:
+            await self.image_client.close()
