@@ -1,9 +1,12 @@
 """MiMo API 客户端 — 支持流式、图片生成、Markdown 输出、Tool Calling"""
 
+import base64
 import json
 import logging
 import re
 from typing import Optional
+
+import httpx
 from openai import AsyncOpenAI
 
 from config import get_settings
@@ -23,13 +26,33 @@ class MiMoClient:
         self.temperature = settings.mimo_temperature
         self.top_p = settings.mimo_top_p
 
-        print(f"\n实际读取到的 API Key: [{settings.mimo_api_key}]")
-        print(f"Key 长度: {len(settings.mimo_api_key)}\n")
+        self.glm_api_key = settings.glm_api_key
+        self.glm_api_base = settings.glm_api_base
+        self.glm_model = settings.glm_model
+
+        self.image_api_key = settings.image_api_key
+        self.image_api_base = settings.image_api_base
+        self.image_model = settings.image_model
+
+        logger.info("MiMoClient 初始化完成")
 
         self.client = AsyncOpenAI(
             api_key=settings.mimo_api_key,
             base_url=settings.mimo_api_base,
         )
+        self.glm_client = AsyncOpenAI(
+            api_key=self.glm_api_key,
+            base_url=self.glm_api_base,
+        ) if self.glm_api_key else None
+
+    def _use_glm_text(self) -> bool:
+        return bool(self.glm_api_key)
+
+    def _get_text_client(self) -> AsyncOpenAI:
+        return self.glm_client or self.client
+
+    def _get_text_model(self) -> str:
+        return self.glm_model if self._use_glm_text() else self.model
 
     # ──────────────────────────────────────────────
     #  核心：上下文压缩
@@ -68,10 +91,12 @@ class MiMoClient:
             elif content:
                 old_text += f"[{role}]: {content}\n"
 
-        # 调用 MiMo 生成摘要
+        # 调用文本模型生成摘要
+        text_client = self._get_text_client()
+        text_model = self._get_text_model()
         try:
-            summary_response = await self.client.chat.completions.create(
-                model=self.model,
+            summary_response = await text_client.chat.completions.create(
+                model=text_model,
                 messages=[
                     {
                         "role": "system",
@@ -146,9 +171,12 @@ class MiMoClient:
             payload_messages.append({"role": "system", "content": system_prompt})
         payload_messages.extend(messages)
 
+        text_client = self._get_text_client()
+        text_model = self._get_text_model()
+
         try:
-            completion = await self.client.chat.completions.create(
-                model=self.model,
+            completion = await text_client.chat.completions.create(
+                model=text_model,
                 messages=payload_messages,
                 max_completion_tokens=max_tokens or self.max_tokens,
                 temperature=temperature or self.temperature,
@@ -206,8 +234,9 @@ class MiMoClient:
             payload_messages = await self._compact_messages(payload_messages)
 
             try:
+                text_client = self._get_text_client()
                 kwargs = {
-                    "model": self.model,
+                    "model": self._get_text_model(),
                     "messages": payload_messages,
                     "max_completion_tokens": self.max_tokens,
                     "temperature": self.temperature,
@@ -217,7 +246,7 @@ class MiMoClient:
                     "tool_choice": "auto",
                 }
 
-                completion = await self.client.chat.completions.create(**kwargs)
+                completion = await text_client.chat.completions.create(**kwargs)
                 message = completion.choices[0].message
 
                 logger.info(
@@ -267,6 +296,9 @@ class MiMoClient:
 
             except Exception as e:
                 error_str = str(e)
+                if "402" in error_str or "insufficient_balance" in error_str.lower() or "payment required" in error_str.lower():
+                    logger.error(f"账户余额不足: {e}")
+                    return "文本模型余额不足。若你是在要生成图片，请使用 /img + 描述（例如：/img 海边美女）。"
                 if "429" in error_str or "token" in error_str.lower() or "rate limit" in error_str.lower():
                     logger.error(f"Token/速率限制: {e}")
                     return "请求内容过多或频率过高，请稍后重试或简化问题。"
@@ -294,6 +326,52 @@ class MiMoClient:
 - 列表用 - 或 1.
 - 适当使用引用 > """
         return await self.chat(messages, system_prompt=md_system)
+
+
+    async def generate_image(self, prompt: str) -> Optional[bytes]:
+        """调用第三方文生图接口，返回第一张图片字节"""
+        if not self.image_api_key:
+            logger.error("IMAGE_API_KEY 未配置")
+            return None
+
+        image_client = AsyncOpenAI(
+            api_key=self.image_api_key,
+            base_url=self.image_api_base,
+        )
+
+        try:
+            response = await image_client.images.generate(
+                model=self.image_model,
+                prompt=prompt,
+                extra_body={
+                    "negative_prompt": "blurry ugly bad",
+                    "num_inference_steps": 9,
+                    "guidance_scale": 1,
+                    "image_scale": 1,
+                },
+            )
+
+            if not response.data:
+                logger.error("文生图返回为空")
+                return None
+
+            first = response.data[0]
+            if first.url:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    img_resp = await client.get(first.url)
+                    img_resp.raise_for_status()
+                    return img_resp.content
+
+            if first.b64_json:
+                return base64.b64decode(first.b64_json)
+
+            logger.error("文生图返回既无 url 也无 b64_json")
+            return None
+        except Exception as e:
+            logger.error(f"文生图调用失败: {e}", exc_info=True)
+            return None
+        finally:
+            await image_client.close()
 
     # ──────────────────────────────────────────────
     #  图片 HTML 生成
@@ -344,8 +422,9 @@ class MiMoClient:
         payload_messages.extend(messages)
 
         try:
-            stream = await self.client.chat.completions.create(
-                model=self.model,
+            text_client = self._get_text_client()
+            stream = await text_client.chat.completions.create(
+                model=self._get_text_model(),
                 messages=payload_messages,
                 max_completion_tokens=self.max_tokens,
                 temperature=self.temperature,
@@ -363,3 +442,5 @@ class MiMoClient:
 
     async def close(self):
         await self.client.close()
+        if self.glm_client:
+            await self.glm_client.close()

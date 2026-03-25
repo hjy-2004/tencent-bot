@@ -12,6 +12,16 @@ class Settings(BaseSettings):
     mimo_temperature: float = 1.0
     mimo_top_p: float = 0.95
 
+    # GLM 备用文本模型（可选）
+    glm_api_key: str = ""
+    glm_api_base: str = "https://open.bigmodel.cn/api/paas/v4"
+    glm_model: str = "glm-4.7-flash"
+
+    # 第三方文生图 API
+    image_api_key: str = ""
+    image_api_base: str = "https://ai.gitee.com/v1"
+    image_model: str = "z-image-turbo"
+
     # 腾讯机器人
     tencent_app_id: str
     tencent_app_secret: str

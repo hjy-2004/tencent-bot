@@ -655,13 +655,15 @@ def detect_image_intent(text: str) -> ImageIntent | None:
         r"画[张]?(?:给?我)?",
         r"给我?画",
         r"给?我?生成",
+        r"^(?:来|给我|给我来|请|想要)?一[张个幅].+",
     ]
     for pat in gen_patterns:
         if re.search(pat, text):
             desc = re.sub(
-                r"^(?:发[张个幅]?|画[张个幅]?|生成[张个幅]?|帮我?|给我?|我)[的得]?",
+                r"^(?:发[张个幅]?|画[张个幅]?|生成[张个幅]?|帮我?|给我?|我|来|请|想要|来一张|给我一张|给我来一张|一张|一幅|一个)[的得]?",
                 "", text,
             ).strip()
+            desc = re.sub(r"^(?:图|图片|照片)", "", desc).strip()
             desc = re.sub(r"(的|图|图片|照片)$", "", desc).strip()
             if desc:
                 return ImageIntent(intent_type=IMAGE_INTENT_GENERATE, description=desc)
@@ -699,12 +701,10 @@ async def _process_and_reply(
                     return
 
             if intent.intent_type == IMAGE_INTENT_GENERATE and intent.description:
-                html_content = await mimo.generate_image_html(intent.description)
-                if html_content:
-                    image_data = await renderer.html_to_image(html_content)
-                    if image_data:
-                        await send_image_fn(image_data, f"「{intent.description}」", msg_id)
-                        return
+                image_data = await mimo.generate_image(intent.description)
+                if image_data:
+                    await send_image_fn(image_data, f"「{intent.description}」", msg_id)
+                    return
                 await send_text_fn("图片生成失败，请稍后再试。", msg_id)
                 return
 
@@ -931,12 +931,10 @@ async def _process_and_reply(
             await send_text_fn("请描述你想生成的图片，例如：/img 一只可爱的猫咪", msg_id)
             return
 
-        html_content = await mimo.generate_image_html(prompt)
-        if html_content:
-            image_data = await renderer.html_to_image(html_content)
-            if image_data:
-                await send_image_fn(image_data, f"「{prompt}」", msg_id)
-                return
+        image_data = await mimo.generate_image(prompt)
+        if image_data:
+            await send_image_fn(image_data, f"「{prompt}」", msg_id)
+            return
 
         await send_text_fn("图片生成失败，请稍后再试。", msg_id)
         return
