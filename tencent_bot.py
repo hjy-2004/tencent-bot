@@ -37,9 +37,29 @@ conversation_history: dict[str, list[dict]] = defaultdict(list)
 MAX_HISTORY = 20
 session_locks: dict[str, asyncio.Lock] = {}
 
-SYSTEM_PROMPT = """你是一个部署在QQ平台上的智能助手，由小米 MiMo-V2-Pro 驱动。
-你友好、专业、乐于助人。请用简洁清晰的语言回答用户的问题。
-如果不确定答案，请诚实说明。
+_PROVIDER_IDENTITY = {
+    "mimo": "小米 MiMo-V2-Pro",
+    "glm": "智谱 GLM",
+    "deepseek": "DeepSeek",
+    "auto": "AI",
+}
+
+
+def _build_system_prompt() -> str:
+    """根据当前 provider 动态生成 system prompt，让模型如实报告自己的身份。"""
+    provider = mimo._pick_provider()
+    identity = _PROVIDER_IDENTITY.get(provider, "AI")
+    return (
+        f"你是一个部署在QQ平台上的智能助手，当前由 {identity} 驱动。\n"
+        f"你友好、专业、乐于助人。请用简洁清晰的语言回答用户的问题。\n"
+        f"如果不确定答案，请诚实说明。\n"
+        f"当用户询问你是什么模型/语言模型/AI时，请如实告知你是 {identity}，不要冒充其他模型。\n"
+        + _SYSTEM_TOOL_PROMPT
+    )
+
+
+# SYSTEM_PROMPT 保留工具说明部分，身份部分由 _build_system_prompt() 动态生成后拼接
+_SYSTEM_TOOL_PROMPT = """
 
 你可以使用文件系统工具来帮助用户：
 - /fs ls <路径> — 列出目录
@@ -1062,7 +1082,7 @@ async def _process_and_reply(
         conversation_history[session_key].append({"role": "user", "content": prompt})
         reply = await mimo.chat(
             messages=conversation_history[session_key][-MAX_HISTORY:],
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=_build_system_prompt(),
         )
         conversation_history[session_key].append({"role": "assistant", "content": reply})
 
@@ -1090,7 +1110,7 @@ async def _process_and_reply(
         conversation_history[session_key].append({"role": "user", "content": prompt})
         reply = await mimo.chat(
             messages=conversation_history[session_key][-MAX_HISTORY:],
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=_build_system_prompt(),
         )
         conversation_history[session_key].append({"role": "assistant", "content": reply})
 
@@ -1107,7 +1127,7 @@ async def _process_and_reply(
         messages=conversation_history[session_key],
         tools=TOOLS,
         tool_executor=execute_tool,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=_build_system_prompt(),
         max_rounds=20,
     )
 
