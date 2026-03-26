@@ -30,6 +30,12 @@ class MiMoClient:
         self.glm_api_base = settings.glm_api_base
         self.glm_model = settings.glm_model
 
+        self.deepseek_api_key = settings.deepseek_api_key
+        self.deepseek_api_base = settings.deepseek_api_base
+        self.deepseek_model = settings.deepseek_model
+
+        self.default_text_provider = (settings.text_provider or "auto").strip().lower()
+
         self.image_api_key = settings.image_api_key
         self.image_api_base = settings.image_api_base
         self.image_model = settings.image_model
@@ -44,19 +50,83 @@ class MiMoClient:
             api_key=self.glm_api_key,
             base_url=self.glm_api_base,
         ) if self.glm_api_key else None
+        self.deepseek_client = AsyncOpenAI(
+            api_key=self.deepseek_api_key,
+            base_url=self.deepseek_api_base,
+        ) if self.deepseek_api_key else None
         self.image_client = AsyncOpenAI(
             api_key=self.image_api_key,
             base_url=self.image_api_base,
         ) if self.image_api_key else None
 
-    def _use_glm_text(self) -> bool:
-        return bool(self.glm_api_key)
+    def _provider_available(self, provider: str) -> bool:
+        if provider == "deepseek":
+            return bool(self.deepseek_client)
+        if provider == "glm":
+            return bool(self.glm_client)
+        if provider == "mimo":
+            return bool(self.client)
+        return False
 
-    def _get_text_client(self) -> AsyncOpenAI:
-        return self.glm_client or self.client
+    def _pick_provider(self, provider: Optional[str] = None) -> str:
+        selected = (provider or self.default_text_provider or "auto").strip().lower()
+        if selected in ("mimo", "glm", "deepseek"):
+            if self._provider_available(selected):
+                return selected
+            logger.warning(f"指定 provider={selected} 不可用，回退自动路由")
 
-    def _get_text_model(self) -> str:
-        return self.glm_model if self._use_glm_text() else self.model
+        if self.deepseek_client:
+            return "deepseek"
+        if self.glm_client:
+            return "glm"
+        return "mimo"
+
+    def _get_text_client(self, provider: Optional[str] = None) -> AsyncOpenAI:
+        picked = self._pick_provider(provider)
+        if picked == "deepseek":
+            return self.deepseek_client
+        if picked == "glm":
+            return self.glm_client
+        return self.client
+
+    def _get_text_model(self, provider: Optional[str] = None) -> str:
+        picked = self._pick_provider(provider)
+        if picked == "deepseek":
+            return self.deepseek_model
+        if picked == "glm":
+            return self.glm_model
+        return self.model
+
+    def _get_text_provider_info(self, provider: Optional[str] = None) -> tuple[str, AsyncOpenAI, str]:
+        picked = self._pick_provider(provider)
+        return picked, self._get_text_client(picked), self._get_text_model(picked)
+
+    def get_text_provider_status(self, selected_provider: Optional[str] = None) -> dict:
+        selected = (selected_provider or self.default_text_provider or "auto").strip().lower()
+        return {
+            "selected": selected,
+            "active": self._pick_provider(selected),
+            "available": {
+                "mimo": self._provider_available("mimo"),
+                "glm": self._provider_available("glm"),
+                "deepseek": self._provider_available("deepseek"),
+            },
+            "models": {
+                "mimo": self.model,
+                "glm": self.glm_model,
+                "deepseek": self.deepseek_model,
+            },
+        }
+
+    def set_default_text_provider(self, provider: str) -> dict:
+        normalized = (provider or "").strip().lower()
+        if normalized not in ("auto", "mimo", "glm", "deepseek"):
+            raise ValueError("provider 必须是 auto/mimo/glm/deepseek 之一")
+
+        self.default_text_provider = normalized
+        active = self._pick_provider(normalized)
+        logger.info(f"文本模型路由已切换: selected={normalized}, active={active}")
+        return self.get_text_provider_status(normalized)
 
     # ──────────────────────────────────────────────
     #  核心：上下文压缩

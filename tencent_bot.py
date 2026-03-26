@@ -417,17 +417,82 @@ def detect_command(text: str) -> tuple[str, str]:
     """
     检测特殊命令前缀
     返回 (command, remaining_text)
-    支持: /img /card /md /help /fs
+    支持: /img /card /md /help /fs /model
     """
     # /fs 子命令特殊处理
     fs_match = re.match(r"^/fs\s+(\w+)\s*(.*)", text, re.DOTALL | re.IGNORECASE)
     if fs_match:
         return f"fs_{fs_match.group(1).lower()}", fs_match.group(2).strip()
 
-    match = re.match(r"^/(img|card|md|help)\s*(.*)", text, re.DOTALL | re.IGNORECASE)
+    match = re.match(r"^/(img|card|md|help|model|provider)\s*(.*)", text, re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1).lower(), match.group(2).strip()
     return "", text
+
+
+_PROVIDER_ALIAS = {
+    "auto": "auto",
+    "mimo": "mimo",
+    "mi": "mimo",
+    "glm": "glm",
+    "deepseek": "deepseek",
+    "米莫": "mimo",
+    "小米": "mimo",
+    "智谱": "glm",
+    "深度求索": "deepseek",
+    "深度": "deepseek",
+}
+
+
+def _normalize_provider(raw: str) -> Optional[str]:
+    return _PROVIDER_ALIAS.get((raw or "").strip().lower())
+
+
+def _format_provider_status(status: dict) -> str:
+    selected = status.get("selected", "auto")
+    active = status.get("active", "mimo")
+    available = status.get("available", {})
+    models = status.get("models", {})
+
+    def yes_no(v: bool) -> str:
+        return "✅" if v else "❌"
+
+    return (
+        "当前文本模型路由：\n"
+        f"- 选择策略: {selected}\n"
+        f"- 实际生效: {active}\n"
+        f"- mimo: {yes_no(available.get('mimo', False))}  ({models.get('mimo', '-')})\n"
+        f"- glm: {yes_no(available.get('glm', False))}  ({models.get('glm', '-')})\n"
+        f"- deepseek: {yes_no(available.get('deepseek', False))}  ({models.get('deepseek', '-')})"
+    )
+
+
+def detect_provider_intent(text: str) -> Optional[str]:
+    """
+    对话级路由意图识别：
+    - 返回 "__status__" 表示查询当前路由
+    - 返回 provider（auto/mimo/glm/deepseek）表示切换
+    - 返回 None 表示无关
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+
+    if re.search(r"(当前|现在|目前).*(模型|模块|provider|路由)|查看.*(模型|provider|路由)", t):
+        return "__status__"
+
+    direct = _normalize_provider(t)
+    if direct:
+        return direct
+
+    switch_match = re.search(
+        r"(?:切换|改成|改为|换成|使用|切到|route到|路由到)\s*(auto|mimo|glm|deepseek|米莫|小米|智谱|深度求索|深度)",
+        t,
+    )
+    if switch_match:
+        return _normalize_provider(switch_match.group(1))
+
+    return None
 
 # ==================== 文件系统命令解析 ====================
 def parse_fs_args(args_str: str) -> tuple[str, dict]:
@@ -749,13 +814,60 @@ async def _process_and_reply(
                     await send_text_fn(f"未找到「{intent.query}」相关的图片，试试直接描述你想生成的内容：\n例如：「发一张{intent.query}」", msg_id)
                     return
 
+    # ---- /model /provider：文本模型路由切换 ----
+    if command in ("model", "provider"):
+        arg = prompt.strip().lower()
+        if not arg or arg in ("status", "show", "list", "当前", "查看"):
+            status = mimo.get_text_provider_status()
+            await send_text_fn(_format_provider_status(status), msg_id)
+            return
+
+        provider = _normalize_provider(arg)
+        if not provider:
+            await send_text_fn(
+                "用法: /model <auto|mimo|glm|deepseek>\n"
+                "例如: /model deepseek\n"
+                "查看当前: /model status",
+                msg_id,
+            )
+            return
+
+        try:
+            status = mimo.set_default_text_provider(provider)
+            await send_text_fn("✅ 已切换文本模型路由\n" + _format_provider_status(status), msg_id)
+        except Exception as e:
+            await send_text_fn(f"切换失败: {e}", msg_id)
+        return
+
+    # ---- 对话直接切换模块（无需命令）----
+    if not command:
+        provider_intent = detect_provider_intent(text)
+        if provider_intent == "__status__":
+            status = mimo.get_text_provider_status()
+            await send_text_fn(_format_provider_status(status), msg_id)
+            return
+        if provider_intent in ("auto", "mimo", "glm", "deepseek"):
+            try:
+                status = mimo.set_default_text_provider(provider_intent)
+                await send_text_fn("✅ 已切换文本模型路由\n" + _format_provider_status(status), msg_id)
+            except Exception as e:
+                await send_text_fn(f"切换失败: {e}", msg_id)
+            return
+
     # ---- /help ----
     if command == "help":
         help_text = (
             "QQ Bot 指令：\n"
+            "/model <auto|mimo|glm|deepseek> — 切换文本模型路由\n"
+            "/model status — 查看当前模型路由\n"
             "/img <描述> — 生成图片\n"
             "/md <问题> — Markdown 渲染\n"
             "/card <问题> — 卡片格式\n"
+            "——————————————\n"
+            "你也可以直接说：\n"
+            "- 切换到 deepseek\n"
+            "- 改成 glm\n"
+            "- 查看当前模型\n"
             "——————————————\n"
             "/fs ls <路径> — 列出目录\n"
             "/fs read <文件> — 读取文件\n"

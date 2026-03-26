@@ -1,6 +1,6 @@
-# config.py
-from pydantic_settings import BaseSettings
 from functools import lru_cache
+
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -16,6 +16,14 @@ class Settings(BaseSettings):
     glm_api_key: str = ""
     glm_api_base: str = "https://open.bigmodel.cn/api/paas/v4"
     glm_model: str = "glm-4.7-flash"
+
+    # DeepSeek 文本模型（可选）
+    deepseek_api_key: str = ""
+    deepseek_api_base: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-chat"
+
+    # 文本模型默认路由：auto/mimo/glm/deepseek
+    text_provider: str = "auto"
 
     # 第三方文生图 API
     image_api_key: str = ""
