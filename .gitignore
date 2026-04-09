@@ -20,6 +20,8 @@ env/
 # Local history / temp
 .history/
 *.log
+.conversation_history.json
+.conversation_history.json.bak
 
 # Test and tool caches
 .pytest_cache/

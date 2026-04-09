@@ -8,7 +8,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import get_settings
-from tencent_bot import router as bot_router, mimo, renderer, qq_api  # ← 新增 renderer
+from tencent_bot import router as bot_router, mimo, renderer, qq_api, load_history_into_global
+from history_persistence import save_history
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,7 +29,15 @@ async def lifespan(app: FastAPI):
     logger.info(f"  监听地址:  {settings.host}:{settings.port}")
     logger.info("=" * 50)
 
+    # 启动时恢复对话历史
+    load_history_into_global()
+
     yield
+
+    # 关闭前保存对话历史
+    from tencent_bot import conversation_history
+    save_history(dict(conversation_history))
+    logger.info("对话历史已保存")
 
     await mimo.close()
     await renderer.close()  # ← 关闭 Playwright

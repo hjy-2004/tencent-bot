@@ -1,9 +1,11 @@
 from filesystem import FileSystemService
 from filesystem_tools import TOOLS, execute_tool, register_senders, consume_image_sent_flag
+from history_persistence import save_history, load_history
 
 """腾讯 QQ 机器人 — 富媒体版本"""
 
 import asyncio
+import functools
 import json
 import time
 import logging
@@ -37,6 +39,18 @@ conversation_history: dict[str, list[dict]] = defaultdict(list)
 MAX_HISTORY = 20
 session_locks: dict[str, asyncio.Lock] = {}
 
+
+def load_history_into_global() -> None:
+    """从磁盘加载对话历史到全局 conversation_history（启动时调用一次）"""
+    global conversation_history
+    loaded = load_history()
+    if loaded:
+        # 清空当前 defaultdict 并填充加载的数据
+        conversation_history.clear()
+        for k, v in loaded.items():
+            conversation_history[k] = v
+
+
 _PROVIDER_IDENTITY = {
     "mimo": "小米 MiMo-V2-Pro",
     "glm": "智谱 GLM",
@@ -45,11 +59,24 @@ _PROVIDER_IDENTITY = {
 }
 
 
+# Provider 切换时需调用 invalidate_system_prompt_cache() 使缓存失效
+_system_prompt_cache: dict[str, str] = {}
+
+
+def invalidate_system_prompt_cache() -> None:
+    """Provider 切换后调用，清空 system prompt 缓存"""
+    _system_prompt_cache.clear()
+    logger.info("System prompt 缓存已清空")
+
+
 def _build_system_prompt() -> str:
-    """根据当前 provider 动态生成 system prompt，让模型如实报告自己的身份。"""
+    """根据当前 provider 动态生成 system prompt，带缓存（provider 切换时失效）。"""
     provider = mimo._pick_provider()
+    if provider in _system_prompt_cache:
+        return _system_prompt_cache[provider]
+
     identity = _PROVIDER_IDENTITY.get(provider, "AI")
-    return (
+    prompt = (
         f"你是一个部署在QQ平台上的智能助手，当前由 {identity} 驱动。\n"
         f"你友好、专业、乐于助人。请用简洁清晰的语言回答用户的问题。\n"
         f"如果不确定答案，请诚实说明。\n"
@@ -59,6 +86,8 @@ def _build_system_prompt() -> str:
         f"你必须从下方的对话历史中查找并回答，而不是说「我不记得」或「每次对话是独立的」。\n"
         + _SYSTEM_TOOL_PROMPT
     )
+    _system_prompt_cache[provider] = prompt
+    return prompt
 
 
 # SYSTEM_PROMPT 保留工具说明部分，身份部分由 _build_system_prompt() 动态生成后拼接
@@ -865,6 +894,7 @@ async def _process_and_reply(
 
         try:
             status = mimo.set_default_text_provider(provider)
+            invalidate_system_prompt_cache()
             await send_text_fn("✅ 已切换文本模型路由\n" + _format_provider_status(status), msg_id)
         except Exception as e:
             await send_text_fn(f"切换失败: {e}", msg_id)
@@ -880,6 +910,7 @@ async def _process_and_reply(
         if provider_intent in ("auto", "mimo", "glm", "deepseek"):
             try:
                 status = mimo.set_default_text_provider(provider_intent)
+                invalidate_system_prompt_cache()
                 await send_text_fn("✅ 已切换文本模型路由\n" + _format_provider_status(status), msg_id)
             except Exception as e:
                 await send_text_fn(f"切换失败: {e}", msg_id)
@@ -1174,6 +1205,9 @@ async def _run_session_serialized(session_key: str, task_coro):
 
     async with lock:
         await task_coro
+
+    # 每轮对话结束后自动保存历史（受 _SAVE_INTERVAL 节流）
+    save_history(dict(conversation_history))
 
 
 async def handle_c2c_message(event_data: dict):
