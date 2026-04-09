@@ -11,7 +11,7 @@ import re
 import binascii
 import httpx
 from typing import Optional
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from pathlib import Path
 
 from fastapi import APIRouter, Request, UploadFile, File, Form
@@ -30,7 +30,7 @@ router = APIRouter()
 mimo = MiMoClient()
 renderer = ImageRenderer()
 
-processed_messages: set[str] = set()
+processed_messages: OrderedDict[str, float] = OrderedDict()
 MAX_PROCESSED = 10000
 
 conversation_history: dict[str, list[dict]] = defaultdict(list)
@@ -54,6 +54,9 @@ def _build_system_prompt() -> str:
         f"你友好、专业、乐于助人。请用简洁清晰的语言回答用户的问题。\n"
         f"如果不确定答案，请诚实说明。\n"
         f"当用户询问你是什么模型/语言模型/AI时，请如实告知你是 {identity}，不要冒充其他模型。\n"
+        f"【重要】你拥有当前会话的完整对话历史。以下 messages 列表就是你们从开始到现在的全部对话内容。\n"
+        f"当用户说「上次」「之前」「记得吗」「之前说了什么」等时，\n"
+        f"你必须从下方的对话历史中查找并回答，而不是说「我不记得」或「每次对话是独立的」。\n"
         + _SYSTEM_TOOL_PROMPT
     )
 
@@ -168,7 +171,7 @@ class QQBotAPI:
         self.app_secret = settings.tencent_app_secret
         self.base_url = "https://api.sgroup.qq.com"
         self.access_token: Optional[str] = None
-        self._token_fetched: bool = False  # 是否已获取过 token
+        self._token_expires_at: float = 0  # token 过期时间戳（秒）
         self.http_client = httpx.AsyncClient(timeout=30.0)
 
     # ---------- Token 管理 ----------
@@ -192,17 +195,25 @@ class QQBotAPI:
                 raise Exception("获取的 access_token 为空")
 
             self.access_token = token
-            self._token_fetched = True
-            logger.info(f"Token 已更新并缓存 (expires_in={expires_in}s)")
+            # 记录过期时间戳，留 60s 缓冲
+            self._token_expires_at = time.time() + expires_in - 60
+            logger.info(
+                f"Token 已更新并缓存 (有效期={expires_in}s, "
+                f"刷新线={expires_in-60}s, 刷新时间戳={self._token_expires_at:.0f})"
+            )
             return self.access_token
         except Exception as e:
             logger.error(f"获取 token 异常: {e}", exc_info=True)
             raise
 
     async def _ensure_token(self):
-        """仅在从未获取过 token 时才拉取，已缓存的 token 直接复用"""
-        if not self._token_fetched:
-            logger.info("首次获取 Token...")
+        """检查 token 是否需要刷新：从未获取 / 接近过期（60s 缓冲）"""
+        now = time.time()
+        if not self.access_token:
+            logger.info("Token 为空，首次获取")
+            await self.get_access_token()
+        elif now >= self._token_expires_at:
+            logger.info(f"Token 已临过期（剩余 {max(0, self._token_expires_at - now):.0f}s），主动刷新")
             await self.get_access_token()
 
     def _is_token_error(self, resp: httpx.Response) -> bool:
@@ -1122,6 +1133,11 @@ async def _process_and_reply(
     if len(conversation_history[session_key]) > MAX_HISTORY:
         conversation_history[session_key] = conversation_history[session_key][-MAX_HISTORY:]
 
+    logger.info(
+        f"[{session_key}] 对话历史共 {len(conversation_history[session_key])} 条，"
+        f"内容预览: {[m['role'] for m in conversation_history[session_key]]}"
+    )
+
     # ★ 使用 chat_with_tools 自动处理工具调用
     reply = await mimo.chat_with_tools(
         messages=conversation_history[session_key],
@@ -1169,9 +1185,12 @@ async def handle_c2c_message(event_data: dict):
 
     if msg_id in processed_messages:
         return
-    processed_messages.add(msg_id)
-    if len(processed_messages) > MAX_PROCESSED:
-        processed_messages.clear()
+    if len(processed_messages) >= MAX_PROCESSED:
+        # LRU 淘汰：移除最旧的 10% 条目
+        evict_count = max(1, MAX_PROCESSED // 10)
+        for _ in range(evict_count):
+            processed_messages.popitem(last=False)
+    processed_messages[msg_id] = time.time()
 
     text = extract_message_text(content)
     if not text:
@@ -1207,7 +1226,11 @@ async def handle_group_at_message(event_data: dict):
 
     if msg_id in processed_messages:
         return
-    processed_messages.add(msg_id)
+    if len(processed_messages) >= MAX_PROCESSED:
+        evict_count = max(1, MAX_PROCESSED // 10)
+        for _ in range(evict_count):
+            processed_messages.popitem(last=False)
+    processed_messages[msg_id] = time.time()
 
     group_openid = event_data.get("group_openid", "")
     author_openid = event_data.get("author", {}).get("member_openid", "")
@@ -1245,7 +1268,11 @@ async def handle_direct_message(event_data: dict):
 
     if msg_id in processed_messages:
         return
-    processed_messages.add(msg_id)
+    if len(processed_messages) >= MAX_PROCESSED:
+        evict_count = max(1, MAX_PROCESSED // 10)
+        for _ in range(evict_count):
+            processed_messages.popitem(last=False)
+    processed_messages[msg_id] = time.time()
 
     author = event_data.get("author", {})
     user_openid = author.get("user_openid", "")
@@ -1283,7 +1310,11 @@ async def handle_at_message(event_data: dict):
 
     if msg_id in processed_messages:
         return
-    processed_messages.add(msg_id)
+    if len(processed_messages) >= MAX_PROCESSED:
+        evict_count = max(1, MAX_PROCESSED // 10)
+        for _ in range(evict_count):
+            processed_messages.popitem(last=False)
+    processed_messages[msg_id] = time.time()
 
     author_id = event_data.get("author", {}).get("id", "")
     channel_id = event_data.get("channel_id", "")

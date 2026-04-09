@@ -192,9 +192,9 @@ class MiMoClient:
                 f"摘要长度 {len(summary)} 字符"
             )
         except Exception as e:
-            logger.warning(f"摘要生成失败，降级为截断: {e}")
-            # 降级：直接截断旧消息，只保留 system + 最近消息
-            return [system_msg, *recent_messages]
+            logger.warning(f"摘要生成失败，降级为保留原始上下文: {e}")
+            # 降级：保留原始消息，不压缩（避免上下文丢失）
+            return messages
 
         # 重新组装
         return [
@@ -306,6 +306,11 @@ class MiMoClient:
         for round_num in range(max_rounds):
             # ⚡ 每轮开始前：压缩上下文
             payload_messages = await self._compact_messages(payload_messages)
+            logger.info(
+                f"chat_with_tools 第{round_num+1}轮 | "
+                f"payload_messages条数={len(payload_messages)} | "
+                f"roles={[m['role'] for m in payload_messages]}"
+            )
 
             try:
                 text_client = self._get_text_client()
