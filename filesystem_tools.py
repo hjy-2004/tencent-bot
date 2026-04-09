@@ -1,5 +1,7 @@
 """文件系统工具定义（OpenAI Function Calling 格式）+ 执行器"""
 
+import asyncio
+import contextvars
 import logging
 from pathlib import Path
 from typing import Callable, Awaitable, Optional
@@ -14,11 +16,29 @@ SendImageFn = Callable[[bytes, str, str], Awaitable[dict]]
 SendTextFn  = Callable[[str, str], Awaitable[dict]]
 _sender_fns: dict = {}
 
+# 当前 session_key（通过 contextvars 传递，解决并发时跨 session 状态覆盖）
+_current_session_key: contextvars.ContextVar[str] = contextvars.ContextVar("session_key", default="")
+
+# Per-session 图片发送标记（keyed by session_key）
+_image_sent_flags: dict[str, bool] = {}
+
+
+def _set_session_key(session_key: str) -> tuple:
+    """设置当前 session_key，返回 (token, key) 用于恢复"""
+    token = _current_session_key.set(session_key)
+    return token, session_key
+
+
+def _reset_session_key(token) -> None:
+    """恢复之前的 session_key"""
+    _current_session_key.reset(token)
+
 
 def register_senders(
     send_image: Optional[SendImageFn] = None,
     send_text:  Optional[SendTextFn]  = None,
     default_msg_id: str = "",
+    session_key: str = "",
 ) -> None:
     """由 tencent_bot 在初始化时注入发送函数"""
     if send_image is not None:
@@ -26,13 +46,16 @@ def register_senders(
     if send_text is not None:
         _sender_fns["send_text"] = send_text
     _sender_fns["default_msg_id"] = default_msg_id
-    _sender_fns["image_sent_in_tool"] = False
+    # 重置当前 session 的标记（使用 session_key 避免并发覆盖）
+    if session_key:
+        _image_sent_flags[session_key] = False
 
 
 def consume_image_sent_flag() -> bool:
-    """读取并清空本轮 fs_send_image 发送标记"""
-    sent = bool(_sender_fns.get("image_sent_in_tool", False))
-    _sender_fns["image_sent_in_tool"] = False
+    """读取并清空本轮 fs_send_image 发送标记（per-session）"""
+    session_key = _current_session_key.get()
+    sent = bool(_image_sent_flags.get(session_key, False))
+    _image_sent_flags[session_key] = False
     return sent
 
 
@@ -329,7 +352,8 @@ async def execute_tool(name: str, arguments: dict) -> str:
                 # _request 成功返回 JSON dict；失败返回 {"status_code": code, "error": "..."}
                 is_success = "status_code" not in result or result.get("status_code") in (200, 201)
                 if is_success:
-                    _sender_fns["image_sent_in_tool"] = True
+                    session_key = _current_session_key.get()
+                    _image_sent_flags[session_key] = True
                     return f"✅ 图片已发送：{fname}"
                 else:
                     err = result.get("error", result.get("message", str(result)))

@@ -1,5 +1,5 @@
 from filesystem import FileSystemService
-from filesystem_tools import TOOLS, execute_tool, register_senders, consume_image_sent_flag
+from filesystem_tools import TOOLS, execute_tool, register_senders, consume_image_sent_flag, _set_session_key, _reset_session_key
 from history_persistence import save_history, load_history
 
 """腾讯 QQ 机器人 — 富媒体版本"""
@@ -36,8 +36,10 @@ processed_messages: OrderedDict[str, float] = OrderedDict()
 MAX_PROCESSED = 10000
 
 conversation_history: dict[str, list[dict]] = defaultdict(list)
-MAX_HISTORY = 20
+MAX_HISTORY = 24
 session_locks: dict[str, asyncio.Lock] = {}
+_session_last_active: dict[str, float] = {}  # session_key -> timestamp
+_SESSION_CLEANUP_TIMEOUT = 3600  # 超过 1 小时的 session 清理其 lock 和内存历史
 
 
 def load_history_into_global() -> None:
@@ -228,7 +230,7 @@ class QQBotAPI:
             self._token_expires_at = time.time() + expires_in - 60
             logger.info(
                 f"Token 已更新并缓存 (有效期={expires_in}s, "
-                f"刷新线={expires_in-60}s, 刷新时间戳={self._token_expires_at:.0f})"
+                f"将在 {expires_in - 60}s 后刷新)"
             )
             return self.access_token
         except Exception as e:
@@ -694,7 +696,7 @@ _IMAGE_EXT_RE   = re.compile(
 
 def _extract_path_at_anchor(text: str, anchor_start: int) -> str:
     """
-    给定 X:\ 在文本中的锚点起始位置，向后贪婪提取完整路径。
+    给定 X:\\ 在文本中的锚点起始位置，向后贪婪提取完整路径。
     遇到空白或非法字符停止。
     """
     remainder = text[anchor_start:]
@@ -717,7 +719,7 @@ def _extract_path_at_anchor(text: str, anchor_start: int) -> str:
 
 def _find_image_path(text: str) -> str | None:
     """
-    在文本中扫描所有 X:\ 锚点，返回第一个匹配图片扩展名的完整路径。
+    在文本中扫描所有 X:\\ 锚点，返回第一个匹配图片扩展名的完整路径。
     """
     for m in _DRIVE_ANCHOR_RE.finditer(text):
         candidate = _extract_path_at_anchor(text, m.start())
@@ -1197,17 +1199,46 @@ async def _process_and_reply(
     await send_text_fn(reply, msg_id)
 
 
-async def _run_session_serialized(session_key: str, task_coro):
+async def _run_session_serialized(
+    session_key: str,
+    task_coro,
+    send_image=None,
+    send_text=None,
+    default_msg_id="",
+):
     lock = session_locks.get(session_key)
     if lock is None:
         lock = asyncio.Lock()
         session_locks[session_key] = lock
 
     async with lock:
-        await task_coro
+        _session_last_active[session_key] = time.time()
+        # 在 lock 内部注册发送器并设置 contextvars（避免并发时跨 session 覆盖状态）
+        token = _set_session_key(session_key)
+        try:
+            register_senders(
+                send_image=send_image,
+                send_text=send_text,
+                default_msg_id=default_msg_id,
+                session_key=session_key,
+            )
+            await task_coro
+        finally:
+            _reset_session_key(token)
 
     # 每轮对话结束后自动保存历史（受 _SAVE_INTERVAL 节流）
     save_history(dict(conversation_history))
+
+    # 清理超时的 session（lock + 内存历史），避免长期运行时内存泄漏
+    now = time.time()
+    expired = [k for k, t in _session_last_active.items() if now - t > _SESSION_CLEANUP_TIMEOUT]
+    for k in expired:
+        session_locks.pop(k, None)
+        _session_last_active.pop(k, None)
+        # 内存中的 conversation_history 也要清理（磁盘已有备份）
+        conversation_history.pop(k, None)
+    if expired:
+        logger.info(f"已清理 {len(expired)} 个超时 session: {expired}")
 
 
 async def handle_c2c_message(event_data: dict):
@@ -1234,11 +1265,6 @@ async def handle_c2c_message(event_data: dict):
     session_key = f"c2c:{user_openid}"
     logger.info(f"私聊 {user_openid}: {text}")
 
-    register_senders(
-        send_image=lambda data, cap, mid: qq_api.send_c2c_image(user_openid, data, cap, mid),
-        send_text =lambda t,   mid: qq_api.send_c2c_message(user_openid, t, mid),
-        default_msg_id=msg_id,
-    )
     await _run_session_serialized(
         session_key,
         _process_and_reply(
@@ -1250,6 +1276,9 @@ async def handle_c2c_message(event_data: dict):
             send_markdown_fn=lambda md, mid=msg_id: qq_api.send_c2c_markdown(user_openid, md, mid),
             msg_id=msg_id,
         ),
+        send_image=lambda data, cap, mid: qq_api.send_c2c_image(user_openid, data, cap, mid),
+        send_text=lambda t, mid: qq_api.send_c2c_message(user_openid, t, mid),
+        default_msg_id=msg_id,
     )
 
 
@@ -1276,11 +1305,6 @@ async def handle_group_at_message(event_data: dict):
     session_key = f"group:{group_openid}:{author_openid}"
     logger.info(f"群聊 {group_openid}: {text}")
 
-    register_senders(
-        send_image=lambda data, cap, mid: qq_api.send_group_image(group_openid, data, cap, mid),
-        send_text =lambda t,   mid: qq_api.send_group_message(group_openid, t, mid),
-        default_msg_id=msg_id,
-    )
     await _run_session_serialized(
         session_key,
         _process_and_reply(
@@ -1292,6 +1316,9 @@ async def handle_group_at_message(event_data: dict):
             send_markdown_fn=lambda md, mid=msg_id: qq_api.send_group_markdown(group_openid, md, mid),
             msg_id=msg_id,
         ),
+        send_image=lambda data, cap, mid: qq_api.send_group_image(group_openid, data, cap, mid),
+        send_text=lambda t, mid: qq_api.send_group_message(group_openid, t, mid),
+        default_msg_id=msg_id,
     )
 
 
@@ -1319,11 +1346,6 @@ async def handle_direct_message(event_data: dict):
     session_key = f"dm:{user_openid}"
     logger.info(f"频道私信 {user_openid}: {text}")
 
-    register_senders(
-        send_image=lambda data, cap, mid: qq_api.send_c2c_image(user_openid, data, cap, mid),
-        send_text =lambda t,   mid: qq_api.send_c2c_message(user_openid, t, mid),
-        default_msg_id=msg_id,
-    )
     await _run_session_serialized(
         session_key,
         _process_and_reply(
@@ -1334,6 +1356,9 @@ async def handle_direct_message(event_data: dict):
             send_markdown_fn=lambda md, mid=msg_id: qq_api.send_c2c_markdown(user_openid, md, mid),
             msg_id=msg_id,
         ),
+        send_image=lambda data, cap, mid: qq_api.send_c2c_image(user_openid, data, cap, mid),
+        send_text=lambda t, mid: qq_api.send_c2c_message(user_openid, t, mid),
+        default_msg_id=msg_id,
     )
 
 
@@ -1360,11 +1385,6 @@ async def handle_at_message(event_data: dict):
     session_key = f"channel:{channel_id}:{author_id}"
     logger.info(f"频道 @消息 {channel_id}: {text}")
 
-    register_senders(
-        send_image=lambda data, cap, mid: qq_api.send_c2c_image(author_id, data, cap, mid),
-        send_text =lambda t,   mid: qq_api.send_channel_message(channel_id, t, mid),
-        default_msg_id=msg_id,
-    )
     await _run_session_serialized(
         session_key,
         _process_and_reply(
@@ -1375,6 +1395,9 @@ async def handle_at_message(event_data: dict):
             send_markdown_fn=lambda md, mid=msg_id: qq_api.send_channel_message(channel_id, md, mid),
             msg_id=msg_id,
         ),
+        send_image=lambda data, cap, mid: qq_api.send_c2c_image(author_id, data, cap, mid),
+        send_text=lambda t, mid: qq_api.send_channel_message(channel_id, t, mid),
+        default_msg_id=msg_id,
     )
 
 
