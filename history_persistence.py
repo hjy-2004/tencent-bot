@@ -10,7 +10,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _HISTORY_FILE = Path(__file__).parent / ".conversation_history.json"
-_SAVE_INTERVAL = 300  # 距离上次保存超过 300s 才写盘（避免频繁 IO）
+_SAVE_INTERVAL = 30  # 距离上次保存超过 30s 才写盘（避免频繁 IO）
 _BACKUP_SUFFIX = ".bak"
 
 _last_save_time: float = 0
@@ -29,12 +29,12 @@ def save_history(history: dict) -> bool:
         return False  # 节流：距离上次保存不足 _SAVE_INTERVAL 秒
 
     try:
-        # 备份旧文件
+        # 备份旧文件（replace 可覆盖已存在的目标，解决 Windows FileExistsError）
         if _HISTORY_FILE.exists():
             backup_path = _HISTORY_FILE.with_suffix(_HISTORY_FILE.suffix + _BACKUP_SUFFIX)
-            _HISTORY_FILE.rename(backup_path)
+            _HISTORY_FILE.replace(backup_path)
 
-        # 原子写入：新文件 → 写完再 rename
+        # 原子写入：新文件 → 写完再 replace
         tmp_path = _HISTORY_FILE.with_suffix(".json.tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False)
