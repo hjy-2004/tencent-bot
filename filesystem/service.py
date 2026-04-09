@@ -94,6 +94,10 @@ class FileSystemService:
         """获取磁盘信息"""
         return await self._impl.get_disk_info()
 
+    async def read_binary(self, path: str) -> tuple[bytes, str]:
+        """读取二进制文件（如图片），返回 (bytes, filename)"""
+        return await self._impl.read_binary(path)
+
     # ==================== 格式化输出（给 QQ 消息用） ====================
 
     async def format_ls(self, path: str) -> str:

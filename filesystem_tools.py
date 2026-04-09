@@ -346,7 +346,7 @@ async def execute_tool(name: str, arguments: dict) -> str:
                 return "图片发送功能暂不可用（未注册发送器）。"
 
             try:
-                data, _ = await fs._impl.read_binary(img_path)
+                data, _ = await fs.read_binary(img_path)
                 fname   = Path(img_path).name
                 result  = await send_image(data, caption, msg_id)
                 # _request 成功返回 JSON dict；失败返回 {"status_code": code, "error": "..."}

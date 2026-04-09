@@ -1,5 +1,6 @@
 """MiMo API 客户端 — 支持流式、图片生成、Markdown 输出、Tool Calling"""
 
+import asyncio
 import base64
 import json
 import logging
@@ -357,21 +358,58 @@ class MiMoClient:
                 })
 
                 # 执行每个工具调用，压缩结果后加入历史
+                # 1. 先解析所有工具参数（提前验证 JSON，避免执行时才发现格式错误）
+                validated_calls: list[tuple] = []
                 for tc in message.tool_calls:
                     name = tc.function.name
-                    args = json.loads(tc.function.arguments)
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"工具 {name} 参数 JSON 解析失败: {e}")
+                        payload_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": f"参数错误：JSON 解析失败 ({e})，请检查参数格式。",
+                        })
+                        continue
+                    validated_calls.append((tc, name, args))
+
+                # 2. 并行执行所有工具（各工具相互独立，gather 提升性能），单个工具 30s 超时
+                async def _run_tool(tc, name, args) -> dict:
                     logger.info(f"执行工具: {name}({args})")
-
-                    result = await tool_executor(name, args)
-
-                    # ⚡ 压缩工具结果
+                    try:
+                        result = await asyncio.wait_for(
+                            tool_executor(name, args),
+                            timeout=30.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"工具 {name} 执行超时（30s）")
+                        result = f"执行超时（30s），请简化操作后重试。"
+                    except Exception as e:
+                        logger.error(f"工具 {name} 执行异常: {e}")
+                        result = f"执行异常: {e}"
                     compressed = self._compress_tool_result(result, name)
-
-                    payload_messages.append({
+                    return {
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": compressed,
-                    })
+                    }
+
+                tool_results = await asyncio.gather(
+                    *[_run_tool(tc, name, args) for tc, name, args in validated_calls],
+                    return_exceptions=True,
+                )
+
+                # 3. 收集结果（gather 保证顺序与输入一致）
+                for item in tool_results:
+                    if isinstance(item, Exception):
+                        payload_messages.append({
+                            "role": "tool",
+                            "tool_call_id": "",
+                            "content": f"工具执行异常: {item}",
+                        })
+                    else:
+                        payload_messages.append(item)
 
             except Exception as e:
                 error_str = str(e)

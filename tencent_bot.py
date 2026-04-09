@@ -1214,7 +1214,7 @@ async def _run_session_serialized(
     async with lock:
         _session_last_active[session_key] = time.time()
         # 在 lock 内部注册发送器并设置 contextvars（避免并发时跨 session 覆盖状态）
-        token = _set_session_key(session_key)
+        token, _ = _set_session_key(session_key)
         try:
             register_senders(
                 send_image=send_image,
