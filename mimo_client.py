@@ -720,60 +720,38 @@ class MiMoClient:
                     ],
                 })
 
-                # ========== 优化1: JSON 预验证 + 并行执行 ==========
+                # ========== 工具执行（参考 CC：不做 JSON 预验证，让 tool 自然报错）==========
 
-                # 1. 预解析所有工具参数（提前验证 JSON，避免执行时才发现格式错误）
-                validated_calls: list[tuple] = []
-                invalid_calls: list[tuple] = []  # JSON 解析失败的调用
-
-                for tc in message.tool_calls:
-                    name = tc.function.name
-                    try:
-                        args = json.loads(tc.function.arguments)
-                        validated_calls.append((tc, name, args))
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"工具 {name} 参数 JSON 解析失败: {e}")
-                        # 生成更具体的错误提示，帮助 LLM 修正
-                        err_detail = _parse_json_error(e, tc.function.arguments)
-                        invalid_calls.append((tc.id, name, err_detail))
-
-                # 立即返回 JSON 解析失败的错误（不执行工具）
-                for tc_id, name, err_detail in invalid_calls:
-                    payload_messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc_id,
-                        "content": f"参数错误：JSON 解析失败。{err_detail}\n\n请使用正确的 JSON 格式，例如：{{\"path\": \"C:\\\\\\\\test\\\\\\\\file.txt\", \"content\": \"文件内容\"}}",
-                        "is_error": True,
-                    })
-
-                if not validated_calls:
-                    # 所有工具调用都失败了，跳过执行
-                    continue
-
-                # 2. 创建流式执行器（优化点：并发安全工具并行执行）
+                # 创建流式执行器（并发安全工具并行执行）
                 executor = StreamingToolExecutor(
                     tool_executor=tool_executor,
                     concurrency_safe_tools=self._concurrency_safe_tools,
                     default_timeout=self._default_tool_timeout,
                 )
 
-                # 添加所有验证通过的调用
-                for tc, name, args in validated_calls:
+                # 添加所有工具调用（不预验证 JSON，让执行时自然报错）
+                for tc in message.tool_calls:
+                    name = tc.function.name
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        # 传递原始字符串，由 tool 执行时处理错误
+                        args = tc.function.arguments
                     timeout = self._tool_timeouts.get(name, self._default_tool_timeout)
                     executor.add_tool(tc.id, name, args, timeout=timeout)
 
                 # 3. 执行所有工具（自动并行/串行切换）
-                logger.info(f"执行 {len(validated_calls)} 个工具调用")
+                logger.info(f"执行 {len(message.tool_calls)} 个工具调用")
                 tool_results = await executor.execute_all()
 
                 # 4. 压缩结果后加入历史
                 for item in tool_results:
                     if isinstance(item, dict) and "content" in item:
                         tool_name = None
-                        # 尝试从原始调用中找到工具名
-                        for tc, name, _ in validated_calls:
+                        # 从原始 tool_calls 中找到工具名
+                        for tc in message.tool_calls:
                             if tc.id == item.get("tool_call_id"):
-                                tool_name = name
+                                tool_name = tc.function.name
                                 break
                         if tool_name:
                             item["content"] = self._compress_tool_result(

@@ -2,9 +2,10 @@
 
 import asyncio
 import contextvars
+import json
 import logging
 from pathlib import Path
-from typing import Callable, Awaitable, Optional
+from typing import Callable, Awaitable, Optional, Union
 from filesystem import FileSystemService
 
 logger = logging.getLogger(__name__)
@@ -283,10 +284,19 @@ TOOLS = [
 
 # ==================== 工具执行器 ====================
 
-async def execute_tool(name: str, arguments: dict) -> str:
+async def execute_tool(name: str, arguments: Union[dict, str]) -> str:
     """
     执行工具调用，返回格式化结果字符串
+
+    arguments 可以是 dict（正常情况）或 str（JSON 解析失败时传递原始字符串）
     """
+    # 处理 JSON 解析失败的情况（arguments 是原始 JSON 字符串）
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError as e:
+            return f"JSON 解析失败：{e}。请确保参数是有效的 JSON 格式。"
+
     try:
         if name == "fs_ls":
             path = arguments.get("path", "C:\\")
