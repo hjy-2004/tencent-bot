@@ -539,9 +539,25 @@ class MiMoClient:
                     {
                         "role": "system",
                         "content": (
-                            "请将以下对话历史压缩成一段简洁的中文摘要。"
-                            "保留所有重要事实：文件路径、命令结果、关键数据、已完成的步骤、"
-                            "发现的问题。不要遗漏关键细节，但去掉冗余输出。"
+                            "你是对话历史压缩助手。请将以下对话压缩成简洁的中文摘要。\n"
+                            "\n"
+                            "【必须保留】\n"
+                            "- 文件路径、目录结构（绝对路径）\n"
+                            "- 命令执行结果（成功/失败/错误信息）\n"
+                            "- 用户明确的需求和偏好\n"
+                            "- 已完成的步骤和当前进度\n"
+                            "- 发现的问题及解决方案\n"
+                            "\n"
+                            "【必须删除】\n"
+                            "- 冗余的重复输出\n"
+                            "- AI 的思考过程和自我对话\n"
+                            "- 无意义的确认和客套话\n"
+                            "- 过长的代码或日志片段（保留关键片段即可）\n"
+                            "\n"
+                            "【输出格式】\n"
+                            "- 一段式中文，200-400 字\n"
+                            "- 用「用户要求」「AI 执行」「结果」「当前状态」分段叙述\n"
+                            "- 不要使用列表，用自然段落"
                         ),
                     },
                     {"role": "user", "content": old_text},
@@ -933,14 +949,31 @@ class MiMoClient:
         style: str = "modern",
     ) -> Optional[str]:
         """让 MiMo 生成可渲染为图片的 HTML 内容"""
-        system = """你是一个 HTML 设计师。根据用户描述，生成一个精美的 HTML 片段。
-要求：
-- 不要包含 <html> <head> <body> 标签，只输出内联内容
-- 使用 inline style
-- 背景色深色渐变，文字浅色
-- 字体用系统中文字体
-- 适合截图分享
-- 宽度 640px，高度自适应"""
+        system = """你是 HTML 海报设计师。根据用户需求生成精美的 HTML 片段。
+
+【输出规范】
+- 仅输出 HTML 代码片段，不包含 <html><head><body> 标签
+- 使用 inline style 属性（style="..."）
+- 宽度固定 640px，高度自适应
+- 背景：深色渐变（如 linear-gradient(135deg, #1a1a2e, #16213e)）
+- 文字：浅色（#ffffff 或 #e0e0e0）
+
+【排版要求】
+- 主标题：28px，加粗，文字阴影
+- 副标题/正文：16-18px
+- 布局整齐，元素居中或左对齐，留有适当 padding
+- 可用 flexbox 布局
+- 字体：系统中文字体（如 "PingFang SC", "Microsoft YaHei", sans-serif）
+
+【内容要求】
+- 根据用户描述生成有意义的内容
+- 文字精炼，适合分享传播
+- 风格现代简洁，适合截图"""
+
+        messages_payload = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"请生成：{prompt}\n风格：{style}"},
+        ]
 
         messages_payload = [
             {"role": "system", "content": system},
