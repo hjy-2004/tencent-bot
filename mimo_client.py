@@ -23,7 +23,6 @@ from config import get_settings
 logger = logging.getLogger(__name__)
 
 # 压缩配置
-COMPACT_THRESHOLD = 24   # 超过 24 条消息才压缩，减少额外摘要请求
 KEEP_RECENT = 8          # 保留最近 8 条不压缩
 
 # 重试配置
@@ -34,8 +33,12 @@ MAX_BACKOFF_MS = 30000
 # Token 估算配置
 # 模型上下文窗口（保守估计，留 2000 token 余量）
 MAX_CONTEXT_TOKENS = 120000
-# 触发预压缩的 token 阈值（达到 80% 时压缩）
-PRE_COMPACT_THRESHOLD = int(MAX_CONTEXT_TOKENS * 0.8)
+
+# 压缩阈值（参考 CC: contextWindow - 20000 reserved - 13000 buffer）
+# 触发压缩的 prompt tokens 阈值
+COMPACT_TOKEN_THRESHOLD = MAX_CONTEXT_TOKENS - 20000 - 13000  # = 87000
+# 保留给输出的 token 余量
+COMPACT_RESERVED_TOKENS = 20000
 
 
 # ==================== Token 估算 ====================
@@ -76,16 +79,13 @@ def estimate_messages_tokens(messages: list[dict]) -> int:
     return sum(_estimate_tokens_for_message(m) for m in messages)
 
 
-def should_pre_compact(messages: list[dict], max_tokens: int = MAX_CONTEXT_TOKENS) -> bool:
+def should_compact_tokens(messages: list[dict]) -> bool:
     """
-    检查是否需要在发送前压缩。
-    基于启发式估算，而非精确计数。
+    检查是否需要压缩（基于 token 估算）。
+    参考 CC 的 shouldAutoCompact：contextWindow - reservedTokens - bufferTokens
     """
-    # 估算 system prompt（假设 500 token）
-    system_overhead = 500
-
-    total = system_overhead + estimate_messages_tokens(messages)
-    return total >= max_tokens * 0.8
+    total = estimate_messages_tokens(messages)
+    return total >= COMPACT_TOKEN_THRESHOLD
 
 
 # ==================== JSON 错误解析 ====================
@@ -503,8 +503,8 @@ class MiMoClient:
         - 最近 KEEP_RECENT 条保留原样
         - 中间旧消息交给 LLM 做摘要
         """
-        if len(messages) <= COMPACT_THRESHOLD:
-            return messages  # 没超阈值，不压缩
+        if not should_compact_tokens(messages):
+            return messages  # 没超 token 阈值，不压缩
 
         # 三刀切分
         system_msg = messages[0]                    # system prompt
@@ -687,15 +687,19 @@ class MiMoClient:
         # 同文件连续编辑检测
         recent_edits: list[tuple[str, str]] = []  # [(path, tool_name), ...]
 
-        # ⚡ 发送前预压缩检查（基于启发式估算，避免超限）
-        estimated = estimate_messages_tokens(payload_messages)
-        if should_pre_compact(payload_messages):
-            logger.info(f"预压缩触发：估算 {estimated} tokens（阈值 {PRE_COMPACT_THRESHOLD}）")
+        # 首次发送前：检查是否需要压缩（避免超限）
+        if should_compact_tokens(payload_messages):
+            estimated = estimate_messages_tokens(payload_messages)
+            logger.info(f"初始压缩触发：估算 {estimated} tokens（阈值 {COMPACT_TOKEN_THRESHOLD}）")
             payload_messages = await self._compact_messages(payload_messages)
 
         for round_num in range(max_rounds):
-            # ⚡ 每轮开始前：压缩上下文
-            payload_messages = await self._compact_messages(payload_messages)
+            # ⚡ 每轮 API 调用前：检查是否需要压缩（基于 token 估算）
+            if should_compact_tokens(payload_messages):
+                estimated = estimate_messages_tokens(payload_messages)
+                logger.info(f"第{round_num+1}轮前压缩触发：估算 {estimated} tokens（阈值 {COMPACT_TOKEN_THRESHOLD}）")
+                payload_messages = await self._compact_messages(payload_messages)
+
             logger.info(
                 f"chat_with_tools 第{round_num+1}轮 | "
                 f"payload_messages条数={len(payload_messages)} | "
