@@ -105,6 +105,53 @@ def _parse_json_error(error: json.JSONDecodeError, raw_args: str) -> str:
         return f"JSON error: {msg} at line {error.lineno} col {error.colno}"
 
 
+# ==================== 同文件连续编辑检测 ====================
+
+def _check_repeated_edits(
+    tool_results: list[dict],
+    recent_edits: list[tuple[str, str]],  # [(path, mode), ...]
+    max_consecutive: int = 3,
+) -> Optional[str]:
+    """
+    检测是否对同一文件进行了连续编辑。
+    返回警告信息，如果超过阈值则提示 LLM 确认。
+    """
+    for item in tool_results:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content", "")
+        # 从 tool_call_id 提取工具名
+        tool_name = None
+        # 检查是否是 fs_edit/fs_touch 等写操作
+        if "文件已修改" in content or "文件已创建" in content or "文件已原子写入" in content:
+            # 尝试从结果中提取路径
+            for line in content.split("\n"):
+                if "D:\\" in line or "C:\\" in line:
+                    # 提取路径
+                    import re
+                    match = re.search(r"([A-Z]:\\[^\s]+)", line)
+                    if match:
+                        path = match.group(1).rstrip(".")
+                        recent_edits.append((path, "edit"))
+
+    # 检查连续编辑同一文件
+    if len(recent_edits) >= max_consecutive:
+        paths = [p for p, _ in recent_edits[-max_consecutive:]]
+        if len(set(paths)) == 1:
+            return (
+                f"注意：你已连续 {max_consecutive} 次编辑同一文件 "
+                f"({paths[0]})。\n"
+                f"请确认是否完成？如需继续编辑请说明原因。\n"
+                f"如已完成，请返回最终结果而非继续调用 fs_edit/fs_touch。"
+            )
+    return None
+
+
+def _is_write_tool(name: str) -> bool:
+    """判断是否为写操作工具"""
+    return name in ("fs_edit", "fs_touch", "fs_mkdir", "fs_rm", "fs_send_image")
+
+
 def _is_retryable_error(error: Exception) -> bool:
     """判断错误是否可重试"""
     error_str = str(error).lower()
@@ -637,6 +684,9 @@ class MiMoClient:
             payload_messages.append({"role": "system", "content": system_prompt})
         payload_messages.extend(messages)
 
+        # 同文件连续编辑检测
+        recent_edits: list[tuple[str, str]] = []  # [(path, tool_name), ...]
+
         # ⚡ 发送前预压缩检查（基于启发式估算，避免超限）
         estimated = estimate_messages_tokens(payload_messages)
         if should_pre_compact(payload_messages):
@@ -758,6 +808,33 @@ class MiMoClient:
                                 item["content"], tool_name
                             )
                     payload_messages.append(item)
+
+                # ⚡ 同文件连续编辑检测
+                if _is_write_tool(tool_name or ""):
+                    # 从结果中提取路径
+                    content = item.get("content", "") if isinstance(item, dict) else ""
+                    import re
+                    for line in content.split("\n"):
+                        match = re.search(r"([A-Z]:\\[^ \n]+)", line)
+                        if match:
+                            path = match.group(1).rstrip(".").rstrip("\\")
+                            recent_edits.append((path, tool_name or ""))
+                            break
+
+                # 超过阈值，插入警告
+                if len(recent_edits) >= 3:
+                    paths = [p for p, _ in recent_edits[-3:]]
+                    if len(set(paths)) == 1:
+                        warning = (
+                            f"[系统提示] 你已连续 3 次编辑同一文件 ({paths[0]})。"
+                            f"请确认修改是否已完成？如已完成请返回最终结果，"
+                            f"不要再继续调用 fs_edit/fs_touch/fs_mkdir 等写操作工具。"
+                        )
+                        payload_messages.append({
+                            "role": "system",
+                            "content": warning,
+                        })
+                        recent_edits.clear()  # 清空，避免重复警告
 
             except Exception as e:
                 error_str = str(e)
