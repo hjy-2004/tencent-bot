@@ -1,4 +1,12 @@
-"""Windows 文件系统实现"""
+"""Windows 文件系统实现
+
+基于 Claude Code 设计:
+- 原子写入（临时文件模式）
+- 文件修改检测（mtime + 内容双重检测）
+- 符号链接安全处理
+- 设备文件屏蔽
+- 读取状态追踪
+"""
 
 import os
 import stat
@@ -6,14 +14,22 @@ import time
 import logging
 import string
 import ctypes
+import shutil
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-from .base import BaseFileSystem, FileEntry, FileContent, SearchResult
+from .base import (
+    BaseFileSystem, FileEntry, FileContent, SearchResult,
+    FileReadState, WriteResult
+)
 from .security import (
     normalize_path, check_path_safety, check_path_exists,
-    SecurityError, MAX_DIR_ENTRIES,
+    check_write_safety, check_delete_safety, SecurityError,
+    is_blocked_device_path, is_unc_path, safe_resolve_path,
+    get_file_modification_time, has_file_changed_since,
+    get_paths_for_permission_check, MAX_DIR_ENTRIES,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +53,61 @@ class WindowsFileSystem(BaseFileSystem):
 
     def __init__(self):
         self._max_read_bytes = 2 * 1024 * 1024  # 单文件最大读取 2MB 文本
+        self._read_states: dict[str, FileReadState] = {}  # 读取状态追踪
+
+    # ==================== 读取状态追踪 ====================
+
+    def get_read_state(self, path: str) -> Optional[FileReadState]:
+        """获取文件读取状态"""
+        p = normalize_path(path)
+        key = str(p)
+        return self._read_states.get(key)
+
+    def update_read_state(self, path: str, state: FileReadState) -> None:
+        """更新文件读取状态"""
+        p = normalize_path(path)
+        key = str(p)
+        self._read_states[key] = state
+
+    def clear_read_state(self, path: str) -> None:
+        """清除文件读取状态"""
+        p = normalize_path(path)
+        key = str(p)
+        self._read_states.pop(key, None)
+
+    # ==================== 安全路径解析 ====================
+
+    def safe_resolve_path(self, path: str) -> tuple[str, bool, bool]:
+        """
+        安全解析文件路径，处理符号链接。
+
+        Returns:
+            (resolved_path, is_symlink, is_canonical)
+        """
+        return safe_resolve_path(path)
+
+    def paths_equal(self, path1: str, path2: str) -> bool:
+        """比较两个路径是否指向同一文件"""
+        try:
+            p1 = normalize_path(path1)
+            p2 = normalize_path(path2)
+            return str(p1).lower() == str(p2).lower()
+        except:
+            return False
+
+    # ==================== 文件修改检测 ====================
+
+    def check_file_modified(
+        self,
+        path: str,
+        since_timestamp: int,
+        content: Optional[str] = None,
+    ) -> bool:
+        """检查文件是否已修改"""
+        p = normalize_path(path)
+        if not p.exists():
+            return True  # 文件不存在，视为已修改
+        return has_file_changed_since(p, since_timestamp, content)
 
     # ==================== 驱动器 ====================
 
@@ -129,6 +200,9 @@ class WindowsFileSystem(BaseFileSystem):
         # 只读标记
         readonly = bool(st.st_file_attributes & stat.FILE_ATTRIBUTE_READONLY) if hasattr(st, 'st_file_attributes') else False
 
+        # 是否为符号链接
+        is_symlink = p.is_symlink()
+
         return FileEntry(
             name=p.name,
             path=str(p),
@@ -137,6 +211,7 @@ class WindowsFileSystem(BaseFileSystem):
             modified=modified,
             extension=p.suffix.lower() if p.is_file() else "",
             permissions="".join(perms) + (" [只读]" if readonly else ""),
+            is_symlink=is_symlink,
         )
 
     # ==================== 读取文件 ====================
@@ -173,6 +248,19 @@ class WindowsFileSystem(BaseFileSystem):
         selected = lines[start_line:end_line]
         truncated = end_line < total_lines
 
+        # 获取修改时间
+        mtime = get_file_modification_time(p)
+
+        # 更新读取状态
+        read_state = FileReadState(
+            content=content,
+            timestamp=mtime,
+            offset=start_line if start_line > 0 else None,
+            limit=max_lines if max_lines < total_lines else None,
+            is_partial_view=(start_line > 0 or truncated),
+        )
+        self.update_read_state(path, read_state)
+
         return FileContent(
             path=str(p),
             name=p.name,
@@ -182,6 +270,7 @@ class WindowsFileSystem(BaseFileSystem):
             lines=total_lines,
             extension=p.suffix.lower(),
             truncated=truncated,
+            mtime=mtime,
         )
 
     async def read_binary(self, path: str) -> tuple[bytes, str]:
@@ -245,19 +334,17 @@ class WindowsFileSystem(BaseFileSystem):
 
         results = []
 
-        # ★ 改进：支持 glob 通配符（* 匹配任意），同时保留子串匹配
-        # 如果 pattern 含 * 或 ? 则走 glob，否则走子串匹配
+        # 支持 glob 通配符（* 匹配任意）
         use_glob = ("*" in pattern or "?" in pattern)
 
-        # ★ 改进：提取纯扩展名（去掉 leading dot，方便比较）
-        # 例如 ".jpg" 或 "jpg" → "jpg"
+        # 提取纯扩展名
         ext_raw = pattern.lstrip("*.").lower()
 
-        # 如果 pattern 看起来像扩展名列表（如 "jpg|jpeg|png"），拆成集合
+        # 扩展名列表
         raw_pattern = pattern
         pattern_parts = [p.strip().lower() for p in raw_pattern.split("|")]
 
-        # ★ 新增：如果传入的是文件，只搜这一个文件
+        # 传入的是文件，只搜这一个文件
         if p.is_file():
             if content_search and p.suffix.lower() in TEXT_EXTENSIONS:
                 try:
@@ -309,7 +396,7 @@ class WindowsFileSystem(BaseFileSystem):
                     ))
             return results
 
-        # 原有逻辑：传入的是目录，递归搜索
+        # 传入的是目录，递归搜索
         if not p.is_dir():
             raise SecurityError(f"搜索路径不是目录: {directory}")
 
@@ -327,7 +414,7 @@ class WindowsFileSystem(BaseFileSystem):
                     continue
 
                 depth = len(root_path.relative_to(p).parts)
-                if depth > 6:
+                if depth > self.MAX_SEARCH_DEPTH:
                     dirs.clear()
                     continue
 
@@ -343,7 +430,7 @@ class WindowsFileSystem(BaseFileSystem):
                     except SecurityError:
                         continue
 
-                    # ★ 改进的匹配逻辑
+                    # 匹配逻辑
                     matched = False
                     if use_glob:
                         for pp in pattern_parts:
@@ -394,6 +481,106 @@ class WindowsFileSystem(BaseFileSystem):
 
         return results
 
+    # ==================== 原子写入 ====================
+
+    def write_file_atomic(
+        self,
+        path: str,
+        content: str,
+        encoding: str = "utf-8",
+        backup: bool = True,
+    ) -> WriteResult:
+        """
+        原子写入文件（临时文件模式）。
+
+        1. 写入临时文件
+        2. 保留原文件权限
+        3. 原子重命名覆盖原文件
+
+        Returns:
+            WriteResult: 写入结果
+        """
+        p = normalize_path(path)
+        check_write_safety(p)
+
+        # 确保父目录存在
+        parent = p.parent
+        if not parent.exists():
+            raise SecurityError(f"父目录不存在: {parent}")
+
+        original_content = None
+        backup_path = None
+
+        # 如果文件存在，读取原始内容（用于可能的回滚）
+        if p.exists():
+            try:
+                original_content = p.read_text(encoding=encoding)
+            except (UnicodeDecodeError, OSError):
+                original_content = None
+
+            # 创建备份
+            if backup and original_content is not None:
+                try:
+                    backup_dir = parent / ".backup"
+                    backup_dir.mkdir(exist_ok=True)
+                    backup_path = backup_dir / f"{p.name}.{int(time.time())}.bak"
+                    shutil.copy2(p, backup_path)
+                    logger.info(f"备份已创建: {backup_path}")
+                except (OSError, PermissionError) as e:
+                    logger.warning(f"创建备份失败: {e}")
+                    backup_path = None
+
+        # 生成临时文件路径
+        temp_fd, temp_path = tempfile.mkstemp(
+            suffix=".tmp",
+            prefix=f".{p.name}.",
+            dir=str(p.parent),
+        )
+        temp_file = Path(temp_path)
+
+        try:
+            # 写入临时文件
+            with os.fdopen(temp_fd, 'w', encoding=encoding) as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())  # 确保写入磁盘
+
+            # 如果原文件存在，复制权限
+            if p.exists():
+                try:
+                    src_stat = p.stat()
+                    os.chmod(temp_path, src_stat.st_mode)
+                except (OSError, PermissionError):
+                    pass  # 忽略权限设置失败
+
+            # 原子重命名（Windows 上会覆盖目标文件）
+            os.replace(temp_path, str(p))
+
+            # 计算行数变化
+            old_lines = (original_content or "").count("\n")
+            new_lines = content.count("\n")
+            lines_changed = abs(new_lines - old_lines)
+
+            logger.info(f"文件已原子写入: {p}")
+
+            return WriteResult(
+                path=str(p),
+                success=True,
+                original_content=original_content,
+                backup_path=str(backup_path) if backup_path else None,
+                lines_changed=lines_changed,
+            )
+
+        except Exception as e:
+            # 清理临时文件
+            try:
+                if temp_file.exists():
+                    temp_file.unlink()
+            except:
+                pass
+
+            raise SecurityError(f"原子写入失败: {e}")
+
     # ==================== 创建文件 ====================
 
     async def create_file(
@@ -404,8 +591,6 @@ class WindowsFileSystem(BaseFileSystem):
         overwrite: bool = False,
     ) -> FileEntry:
         """创建文件"""
-        from .security import check_write_safety
-
         p = normalize_path(path)
         check_write_safety(p)
 
@@ -418,7 +603,14 @@ class WindowsFileSystem(BaseFileSystem):
         if p.exists() and not overwrite:
             raise SecurityError(f"文件已存在（使用 overwrite=True 覆盖）: {p}")
 
-        # 写入
+        # 使用原子写入
+        if p.exists() and overwrite:
+            result = self.write_file_atomic(path, content, encoding, backup=True)
+            if not result.success:
+                raise SecurityError(f"写入失败")
+            return self._path_to_entry(p)
+
+        # 新建文件
         try:
             p.write_text(content, encoding=encoding)
         except PermissionError:
@@ -431,13 +623,11 @@ class WindowsFileSystem(BaseFileSystem):
 
     async def create_directory(self, path: str) -> FileEntry:
         """创建目录（递归创建）"""
-        from .security import check_write_safety
-
         p = normalize_path(path)
         check_write_safety(p)
 
         if p.exists():
-            raise SecurityError(f"路径已存在: {p}")
+            raise SecurityError(f"路径已存在: {path}")
 
         try:
             p.mkdir(parents=True, exist_ok=False)
@@ -453,8 +643,6 @@ class WindowsFileSystem(BaseFileSystem):
 
     async def delete_file(self, path: str) -> str:
         """删除单个文件"""
-        from .security import check_delete_safety
-
         p = normalize_path(path)
         check_path_safety(p)
         check_path_exists(p)
@@ -471,14 +659,14 @@ class WindowsFileSystem(BaseFileSystem):
         except OSError as e:
             raise SecurityError(f"删除失败: {e}")
 
+        # 清除读取状态
+        self.clear_read_state(path)
+
         logger.info(f"文件已删除: {deleted_path}")
         return deleted_path
 
     async def delete_directory(self, path: str, recursive: bool = False) -> str:
         """删除目录"""
-        from .security import check_delete_safety
-        import shutil
-
         p = normalize_path(path)
         check_path_safety(p)
         check_path_exists(p)
@@ -502,6 +690,9 @@ class WindowsFileSystem(BaseFileSystem):
         except OSError as e:
             raise SecurityError(f"删除失败: {e}")
 
+        # 清除读取状态
+        self.clear_read_state(path)
+
         logger.info(f"目录已删除: {deleted_path}")
         return deleted_path
 
@@ -517,9 +708,7 @@ class WindowsFileSystem(BaseFileSystem):
         new_text: str = "",
         encoding: str = "utf-8",
     ) -> FileContent:
-        """修改文件"""
-        from .security import check_write_safety
-
+        """修改文件（使用原子写入保证安全）"""
         p = normalize_path(path)
         check_path_safety(p)
         check_path_exists(p)
@@ -529,95 +718,71 @@ class WindowsFileSystem(BaseFileSystem):
 
         check_write_safety(p)
 
+        # 检查文件是否已被外部修改
+        read_state = self.get_read_state(path)
+        if read_state and not read_state.is_partial_view:
+            if self.check_file_modified(path, read_state.timestamp, read_state.content):
+                raise SecurityError(
+                    "文件已被修改（外部编辑或云同步），请重新读取后再操作"
+                )
+
         # 读取原始内容
         original, detected_enc = self._read_with_encoding(p, encoding)
         lines = original.splitlines()
 
         if mode == "append":
-            # ★ 追加到末尾
             if original and not original.endswith("\n"):
                 original += "\n"
             original += content + "\n"
 
         elif mode == "replace":
-            # ★ 替换整个文件
             original = content
             if not content.endswith("\n"):
                 original += "\n"
 
         elif mode == "insert":
-            # ★ 在指定行之前插入（1-based）
             if line < 1 or line > len(lines) + 1:
                 raise SecurityError(f"行号超出范围: {line} (文件共 {len(lines)} 行)")
             insert_lines = content.splitlines()
             lines[line - 1:line - 1] = insert_lines
             original = "\n".join(lines) + "\n"
 
-
         elif mode == "delete-line":
-
-            # ★ 删除指定行（支持范围如 "3-5"）
-
             line_str = str(line)
-
             if "-" in line_str:
-
                 parts = line_str.split("-")
-
                 start = int(parts[0])
-
                 end = int(parts[1])
-
             else:
-
                 start = end = int(line_str)
 
             if start < 1 or end > len(lines) or start > end:
                 raise SecurityError(
-
                     f"行号超出范围: {start}-{end} (文件共 {len(lines)} 行)"
-
                 )
 
             del lines[start - 1:end]
-
             original = "\n".join(lines) + "\n"
 
-
         elif mode == "replace-line":
-
-            # ★ 替换指定行（支持范围如 "3-5"）
-
             line_str = str(line)
-
             if "-" in line_str:
-
                 parts = line_str.split("-")
-
                 start = int(parts[0])
-
                 end = int(parts[1])
-
             else:
-
                 start = end = int(line_str)
 
             if start < 1 or end > len(lines) or start > end:
                 raise SecurityError(
-
                     f"行号超出范围: {start}-{end} (文件共 {len(lines)} 行)"
-
                 )
 
             replace_lines = content.splitlines()
-
             lines[start - 1:end] = replace_lines
-
             original = "\n".join(lines) + "\n"
 
-
         elif mode == "replace-text":
-            # ★ 全文查找替换
             if not old_text:
                 raise SecurityError("replace-text 模式需要 --old 参数")
             count = original.count(old_text)
@@ -628,15 +793,20 @@ class WindowsFileSystem(BaseFileSystem):
         else:
             raise SecurityError(f"不支持的编辑模式: {mode}")
 
-        # 写入
+        # 使用原子写入
         try:
-            p.write_text(original, encoding=detected_enc)
+            result = self.write_file_atomic(str(p), original, detected_enc, backup=True)
+            if not result.success:
+                raise SecurityError("原子写入失败")
         except PermissionError:
             raise SecurityError(f"无权写入（文件可能被占用）: {p}")
         except OSError as e:
             raise SecurityError(f"写入失败: {e}")
 
         logger.info(f"文件已修改: {p} mode={mode}")
+
+        # 获取新的修改时间
+        mtime = get_file_modification_time(p)
 
         # 返回修改后的结果
         new_lines = original.splitlines()
@@ -649,7 +819,5 @@ class WindowsFileSystem(BaseFileSystem):
             lines=len(new_lines),
             extension=p.suffix.lower(),
             truncated=False,
+            mtime=mtime,
         )
-
-
-
