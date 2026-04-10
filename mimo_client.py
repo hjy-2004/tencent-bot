@@ -13,7 +13,7 @@ import json
 import logging
 import re
 import time
-from typing import Optional, Callable, Awaitable, Any
+from typing import Optional, Callable, Awaitable, Any, Union
 
 import httpx
 from openai import AsyncOpenAI
@@ -25,6 +25,117 @@ logger = logging.getLogger(__name__)
 # 压缩配置
 COMPACT_THRESHOLD = 24   # 超过 24 条消息才压缩，减少额外摘要请求
 KEEP_RECENT = 8          # 保留最近 8 条不压缩
+
+# 重试配置
+MAX_RETRIES = 3
+BASE_DELAY_MS = 500
+MAX_BACKOFF_MS = 30000
+
+# Token 估算配置
+# 模型上下文窗口（保守估计，留 2000 token 余量）
+MAX_CONTEXT_TOKENS = 120000
+# 触发预压缩的 token 阈值（达到 80% 时压缩）
+PRE_COMPACT_THRESHOLD = int(MAX_CONTEXT_TOKENS * 0.8)
+
+
+# ==================== Token 估算 ====================
+
+def _estimate_tokens_for_message(msg: dict) -> int:
+    """
+    估算单条消息的 token 数量。
+    使用粗略启发式：中文约 2 字符/token，英文约 4 字符/token。
+    """
+    content = msg.get("content", "") or ""
+    if isinstance(content, list):
+        # 处理 content 是 blocks 的情况
+        content = " ".join(
+            b.get("text", "") if isinstance(b, dict) else str(b)
+            for b in content if isinstance(b, dict) and b.get("type") == "text"
+        ) or ""
+
+    # 基础开销（role、格式等）
+    overhead = 10
+
+    if not content:
+        # tool_calls 或纯 assistant 消息
+        if msg.get("tool_calls"):
+            tc = msg["tool_calls"][0]
+            fname = tc.get("function", {}).get("name", "") or ""
+            fargs = tc.get("function", {}).get("arguments", "") or ""
+            return overhead + len(fname) // 2 + len(fargs) // 4
+        return overhead
+
+    # 中英文混合估算
+    chinese_chars = sum(1 for c in content if '\u4e00' <= c <= '\u9fff')
+    other_chars = len(content) - chinese_chars
+    return overhead + chinese_chars // 2 + other_chars // 4
+
+
+def estimate_messages_tokens(messages: list[dict]) -> int:
+    """估算消息列表的总 token 数"""
+    return sum(_estimate_tokens_for_message(m) for m in messages)
+
+
+def should_pre_compact(messages: list[dict], max_tokens: int = MAX_CONTEXT_TOKENS) -> bool:
+    """
+    检查是否需要在发送前压缩。
+    基于启发式估算，而非精确计数。
+    """
+    # 估算 system prompt（假设 500 token）
+    system_overhead = 500
+
+    total = system_overhead + estimate_messages_tokens(messages)
+    return total >= max_tokens * 0.8
+
+
+# ==================== 重试机制 ====================
+
+def _is_retryable_error(error: Exception) -> bool:
+    """判断错误是否可重试"""
+    error_str = str(error).lower()
+    status_code = None
+
+    # 尝试提取状态码
+    if hasattr(error, 'status_code'):
+        status_code = error.status_code
+    elif hasattr(error, 'response') and hasattr(error.response, 'status_code'):
+        status_code = error.response.status_code
+
+    # 429/529/500/502/503 可重试
+    if status_code in (429, 500, 502, 503, 529):
+        return True
+    # 服务端超时可重试
+    if "timeout" in error_str or "timed out" in error_str:
+        return True
+    # 连接错误可重试
+    if "connection" in error_str or "network" in error_str:
+        return True
+    return False
+
+
+def _is_auth_error(error: Exception) -> bool:
+    """判断是否是认证/授权错误（不可重试）"""
+    error_str = str(error).lower()
+    if hasattr(error, 'status_code'):
+        return error.status_code in (401, 403, 402)
+    return "auth" in error_str or "credential" in error_str or "unauthorized" in error_str
+
+
+def _get_error_status_code(error: Exception) -> Optional[int]:
+    """从错误中提取状态码"""
+    if hasattr(error, 'status_code'):
+        return error.status_code
+    if hasattr(error, 'response') and hasattr(error.response, 'status_code'):
+        return error.response.status_code
+    return None
+
+
+async def _sleep_with_jitter(base_ms: int, attempt: int) -> None:
+    """指数退避 + 随机抖动"""
+    import random
+    import asyncio
+    delay = min(base_ms * (2 ** attempt) + random.randint(0, base_ms), MAX_BACKOFF_MS)
+    await asyncio.sleep(delay / 1000)
 
 
 # ==================== 工具执行器 ====================
@@ -305,6 +416,7 @@ class MiMoClient:
                 "mimo": self.model,
                 "glm": self.glm_model,
                 "deepseek": self.deepseek_model,
+                
             },
         }
 
@@ -438,36 +550,51 @@ class MiMoClient:
         text_client = self._get_text_client()
         text_model = self._get_text_model()
 
-        try:
-            completion = await text_client.chat.completions.create(
-                model=text_model,
-                messages=payload_messages,
-                max_completion_tokens=max_tokens or self.max_tokens,
-                temperature=temperature or self.temperature,
-                top_p=self.top_p,
-                stream=False,
-                frequency_penalty=0,
-                presence_penalty=0,
-            )
-            reply = completion.choices[0].message.content
-            usage = completion.usage
-            logger.info(
-                f"MiMo 响应成功 | "
-                f"prompt={usage.prompt_tokens} | "
-                f"completion={usage.completion_tokens}"
-            )
-            return reply
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                completion = await text_client.chat.completions.create(
+                    model=text_model,
+                    messages=payload_messages,
+                    max_completion_tokens=max_tokens or self.max_tokens,
+                    temperature=temperature or self.temperature,
+                    top_p=self.top_p,
+                    stream=False,
+                    frequency_penalty=0,
+                    presence_penalty=0,
+                )
+                reply = completion.choices[0].message.content
+                usage = completion.usage
+                logger.info(
+                    f"MiMo 响应成功 | "
+                    f"prompt={usage.prompt_tokens} | "
+                    f"completion={usage.completion_tokens}"
+                )
+                return reply
 
-        except Exception as e:
-            import traceback
-            print(f"\n{'!'*50}")
-            print(f"MiMo 调用失败详情:")
-            print(f"  类型: {type(e).__name__}")
-            print(f"  信息: {e}")
-            traceback.print_exc()
-            print(f"{'!'*50}\n")
-            logger.error(f"MiMo API 异常: {e}", exc_info=True)
-            return "抱歉，AI 服务暂时不可用，请稍后再试。"
+            except Exception as e:
+                if attempt < MAX_RETRIES and _is_retryable_error(e):
+                    status = _get_error_status_code(e)
+                    logger.warning(
+                        f"MiMo API 可重试错误 (attempt {attempt + 1}/{MAX_RETRIES + 1}): "
+                        f"{type(e).__name__} status={status} - {e}"
+                    )
+                    await _sleep_with_jitter(BASE_DELAY_MS, attempt)
+                    continue
+
+                # 认证/授权错误不重试
+                if _is_auth_error(e):
+                    logger.error(f"MiMo 认证错误（不重试）: {e}")
+                    return "抱歉，AI 服务认证失败，请检查配置。"
+
+                import traceback
+                print(f"\n{'!'*50}")
+                print(f"MiMo 调用失败详情:")
+                print(f"  类型: {type(e).__name__}")
+                print(f"  信息: {e}")
+                traceback.print_exc()
+                print(f"{'!'*50}\n")
+                logger.error(f"MiMo API 异常: {e}", exc_info=True)
+                return "抱歉，AI 服务暂时不可用，请稍后再试。"
 
     # ──────────────────────────────────────────────
     #  工具调用循环（集成上下文压缩 + 并行执行优化）
@@ -495,6 +622,12 @@ class MiMoClient:
             payload_messages.append({"role": "system", "content": system_prompt})
         payload_messages.extend(messages)
 
+        # ⚡ 发送前预压缩检查（基于启发式估算，避免超限）
+        estimated = estimate_messages_tokens(payload_messages)
+        if should_pre_compact(payload_messages):
+            logger.info(f"预压缩触发：估算 {estimated} tokens（阈值 {PRE_COMPACT_THRESHOLD}）")
+            payload_messages = await self._compact_messages(payload_messages)
+
         for round_num in range(max_rounds):
             # ⚡ 每轮开始前：压缩上下文
             payload_messages = await self._compact_messages(payload_messages)
@@ -505,20 +638,44 @@ class MiMoClient:
             )
 
             try:
-                text_client = self._get_text_client()
-                kwargs = {
-                    "model": self._get_text_model(),
-                    "messages": payload_messages,
-                    "max_completion_tokens": self.max_tokens,
-                    "temperature": self.temperature,
-                    "top_p": self.top_p,
-                    "stream": False,
-                    "tools": tools,
-                    "tool_choice": "auto",
-                }
+                success = False
+                for attempt in range(MAX_RETRIES + 1):
+                    try:
+                        text_client = self._get_text_client()
+                        kwargs = {
+                            "model": self._get_text_model(),
+                            "messages": payload_messages,
+                            "max_completion_tokens": self.max_tokens,
+                            "temperature": self.temperature,
+                            "top_p": self.top_p,
+                            "stream": False,
+                            "tools": tools,
+                            "tool_choice": "auto",
+                        }
 
-                completion = await text_client.chat.completions.create(**kwargs)
-                message = completion.choices[0].message
+                        completion = await text_client.chat.completions.create(**kwargs)
+                        message = completion.choices[0].message
+                        success = True
+                        break
+
+                    except Exception as e:
+                        if attempt < MAX_RETRIES and _is_retryable_error(e):
+                            status = _get_error_status_code(e)
+                            logger.warning(
+                                f"chat_with_tools 第{round_num + 1}轮 可重试错误 "
+                                f"(attempt {attempt + 1}/{MAX_RETRIES + 1}): "
+                                f"{type(e).__name__} status={status} - {e}"
+                            )
+                            await _sleep_with_jitter(BASE_DELAY_MS, attempt)
+                            continue
+
+                        if _is_auth_error(e):
+                            return "抱歉，AI 服务认证失败，请检查配置。"
+
+                        raise
+
+                if not success:
+                    raise Exception("重试次数耗尽")
 
                 logger.info(
                     f"MiMo 第{round_num + 1}轮 | "
