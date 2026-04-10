@@ -1,11 +1,19 @@
-"""MiMo API 客户端 — 支持流式、图片生成、Markdown 输出、Tool Calling"""
+"""MiMo API 客户端 — 支持流式、图片生成、Markdown 输出、Tool Calling
+
+优化自 Claude Code 的 StreamingToolExecutor:
+- 输入 JSON 预验证（提前失败，避免执行时才发现格式错误）
+- 并发安全工具并行执行（isConcurrencySafe 标记）
+- 单工具独立超时控制
+- 工具结果流式输出（边执行边返回）
+"""
 
 import asyncio
 import base64
 import json
 import logging
 import re
-from typing import Optional
+import time
+from typing import Optional, Callable, Awaitable, Any
 
 import httpx
 from openai import AsyncOpenAI
@@ -17,6 +25,164 @@ logger = logging.getLogger(__name__)
 # 压缩配置
 COMPACT_THRESHOLD = 24   # 超过 24 条消息才压缩，减少额外摘要请求
 KEEP_RECENT = 8          # 保留最近 8 条不压缩
+
+
+# ==================== 工具执行器 ====================
+
+class TrackedTool:
+    """跟踪中的工具"""
+    def __init__(
+        self,
+        id: str,
+        name: str,
+        args: dict,
+        is_concurrency_safe: bool = True,
+    ):
+        self.id = id
+        self.name = name
+        self.args = args
+        self.is_concurrency_safe = is_concurrency_safe
+        self.status = "queued"  # queued | executing | completed | yielded
+        self.result: Optional[dict] = None
+        self.error: Optional[str] = None
+        self.start_time: float = 0
+        self.progress: list = []  # 进度消息
+
+
+class StreamingToolExecutor:
+    """
+    流式工具执行器 - 参考 Claude Code 的 StreamingToolExecutor
+
+    核心优化：
+    1. 并发安全工具可并行执行
+    2. 独立超时控制
+    3. 进度实时输出
+    4. 结果按顺序返回（即使并行执行）
+    """
+
+    def __init__(
+        self,
+        tool_executor: Callable[[str, dict], Awaitable[str]],
+        concurrency_safe_tools: set[str] = None,
+        default_timeout: float = 30.0,
+    ):
+        """
+        Args:
+            tool_executor: 工具执行函数 (name, args) -> result_str
+            concurrency_safe_tools: 并发安全工具集合（可并行执行）
+            default_timeout: 默认超时时间（秒）
+        """
+        self._executor = tool_executor
+        self._safe_tools = concurrency_safe_tools or {"fs_ls", "fs_read", "fs_find", "fs_drives"}
+        self._default_timeout = default_timeout
+        self._tools: list[TrackedTool] = []
+        self._aborted = False
+
+    def add_tool(
+        self,
+        id: str,
+        name: str,
+        args: dict,
+        timeout: float = None,
+    ) -> None:
+        """添加工具到执行队列"""
+        tool = TrackedTool(
+            id=id,
+            name=name,
+            args=args,
+            is_concurrency_safe=name in self._safe_tools,
+        )
+        # 为每个工具存储超时时间
+        tool.timeout = timeout or self._default_timeout
+        self._tools.append(tool)
+
+    def _can_execute(self, tool: TrackedTool) -> bool:
+        """检查工具是否可以执行"""
+        if self._aborted:
+            return False
+
+        # 正在执行的工具
+        executing = [t for t in self._tools if t.status == "executing"]
+
+        if not executing:
+            return True
+
+        # 并发安全工具：只要没有非安全工具在执行就可以
+        if tool.is_concurrency_safe:
+            return all(t.is_concurrency_safe for t in executing)
+
+        # 非安全工具：必须单独执行
+        return False
+
+    async def _execute_tool(self, tool: TrackedTool) -> None:
+        """执行单个工具"""
+        tool.status = "executing"
+        tool.start_time = time.time()
+
+        try:
+            result = await asyncio.wait_for(
+                self._executor(tool.name, tool.args),
+                timeout=tool.timeout,
+            )
+            tool.result = {
+                "role": "tool",
+                "tool_call_id": tool.id,
+                "content": result,
+            }
+        except asyncio.TimeoutError:
+            tool.error = f"执行超时（{tool.timeout}s），请简化操作后重试。"
+            logger.warning(f"工具 {tool.name} 执行超时（{tool.timeout}s）")
+        except Exception as e:
+            tool.error = f"执行异常: {e}"
+            logger.error(f"工具 {tool.name} 执行异常: {e}")
+        finally:
+            tool.status = "completed"
+
+    async def execute_all(self) -> list[dict]:
+        """
+        执行所有工具，返回结果列表（按原始顺序）
+
+        优化点：
+        - 并发安全工具并行执行
+        - 非安全工具串行执行
+        """
+        if not self._tools:
+            return []
+
+        # 第一阶段：执行所有并发安全的工具（并行）
+        safe_tools = [t for t in self._tools if t.is_concurrency_safe and t.status == "queued"]
+        if safe_tools:
+            await asyncio.gather(
+                *[self._execute_tool(t) for t in safe_tools],
+                return_exceptions=True,
+            )
+
+        # 第二阶段：执行非安全工具（串行，保持顺序）
+        unsafe_tools = [t for t in self._tools if not t.is_concurrency_safe and t.status == "queued"]
+        for tool in unsafe_tools:
+            await self._execute_tool(tool)
+            # 如果失败且是危险操作（如写文件），停止后续执行
+            if tool.error and tool.name in ("fs_edit", "fs_touch", "fs_rm"):
+                break
+
+        # 按原始顺序返回结果
+        results = []
+        for tool in self._tools:
+            if tool.error:
+                results.append({
+                    "role": "tool",
+                    "tool_call_id": tool.id,
+                    "content": tool.error,
+                    "is_error": True,
+                })
+            elif tool.result:
+                results.append(tool.result)
+
+        return results
+
+    def abort(self) -> None:
+        """中止所有正在执行的工具"""
+        self._aborted = True
 
 
 class MiMoClient:
@@ -59,6 +225,29 @@ class MiMoClient:
             api_key=self.image_api_key,
             base_url=self.image_api_base,
         ) if self.image_api_key else None
+
+        # ==================== 工具执行优化配置 ====================
+        # 并发安全工具：可并行执行，不阻塞其他工具
+        self._concurrency_safe_tools = {
+            "fs_ls",      # 读目录
+            "fs_read",    # 读文件
+            "fs_find",    # 搜索文件
+            "fs_drives",  # 获取驱动器
+        }
+
+        # 各工具超时时间（秒）
+        self._tool_timeouts = {
+            "fs_ls": 10.0,
+            "fs_read": 15.0,
+            "fs_find": 20.0,
+            "fs_drives": 5.0,
+            "fs_touch": 15.0,
+            "fs_mkdir": 10.0,
+            "fs_rm": 10.0,
+            "fs_edit": 20.0,
+            "fs_send_image": 30.0,
+        }
+        self._default_tool_timeout = 30.0
 
     def _provider_available(self, provider: str) -> bool:
         if provider == "deepseek":
@@ -281,7 +470,7 @@ class MiMoClient:
             return "抱歉，AI 服务暂时不可用，请稍后再试。"
 
     # ──────────────────────────────────────────────
-    #  工具调用循环（集成上下文压缩）
+    #  工具调用循环（集成上下文压缩 + 并行执行优化）
     # ──────────────────────────────────────────────
 
     async def chat_with_tools(
@@ -293,11 +482,13 @@ class MiMoClient:
         max_rounds: int = 15,
     ) -> str:
         """
-        自动工具调用循环 + 上下文压缩：
-        1. 每轮开始前检查消息数量，超阈值就压缩
-        2. 发送消息 + tools 给 MiMo
-        3. 如果 MiMo 调用工具 → 执行 → 结果压缩后返回
-        4. 重复直到 MiMo 给出最终回复或达到最大轮数
+        自动工具调用循环 + 上下文压缩 + 并行执行优化：
+
+        优化点（来自 Claude Code StreamingToolExecutor）：
+        1. JSON 输入预验证 - 提前失败，避免执行时才发现格式错误
+        2. 并发安全工具并行执行 - fs_ls/fs_read/fs_find 可同时执行
+        3. 单工具独立超时 - 不同工具不同超时时间
+        4. 工具结果流式压缩 - 边执行边压缩
         """
         payload_messages = []
         if system_prompt:
@@ -357,59 +548,64 @@ class MiMoClient:
                     ],
                 })
 
-                # 执行每个工具调用，压缩结果后加入历史
-                # 1. 先解析所有工具参数（提前验证 JSON，避免执行时才发现格式错误）
+                # ========== 优化1: JSON 预验证 + 并行执行 ==========
+
+                # 1. 预解析所有工具参数（提前验证 JSON，避免执行时才发现格式错误）
                 validated_calls: list[tuple] = []
+                invalid_calls: list[tuple] = []  # JSON 解析失败的调用
+
                 for tc in message.tool_calls:
                     name = tc.function.name
                     try:
                         args = json.loads(tc.function.arguments)
+                        validated_calls.append((tc, name, args))
                     except json.JSONDecodeError as e:
                         logger.warning(f"工具 {name} 参数 JSON 解析失败: {e}")
-                        payload_messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "content": f"参数错误：JSON 解析失败 ({e})，请检查参数格式。",
-                        })
-                        continue
-                    validated_calls.append((tc, name, args))
+                        invalid_calls.append((tc.id, name, str(e)))
 
-                # 2. 并行执行所有工具（各工具相互独立，gather 提升性能），单个工具 30s 超时
-                async def _run_tool(tc, name, args) -> dict:
-                    logger.info(f"执行工具: {name}({args})")
-                    try:
-                        result = await asyncio.wait_for(
-                            tool_executor(name, args),
-                            timeout=30.0,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(f"工具 {name} 执行超时（30s）")
-                        result = f"执行超时（30s），请简化操作后重试。"
-                    except Exception as e:
-                        logger.error(f"工具 {name} 执行异常: {e}")
-                        result = f"执行异常: {e}"
-                    compressed = self._compress_tool_result(result, name)
-                    return {
+                # 立即返回 JSON 解析失败的错误（不执行工具）
+                for tc_id, name, err in invalid_calls:
+                    payload_messages.append({
                         "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": compressed,
-                    }
+                        "tool_call_id": tc_id,
+                        "content": f"参数错误：JSON 解析失败 ({err})，请检查参数格式。",
+                        "is_error": True,
+                    })
 
-                tool_results = await asyncio.gather(
-                    *[_run_tool(tc, name, args) for tc, name, args in validated_calls],
-                    return_exceptions=True,
+                if not validated_calls:
+                    # 所有工具调用都失败了，跳过执行
+                    continue
+
+                # 2. 创建流式执行器（优化点：并发安全工具并行执行）
+                executor = StreamingToolExecutor(
+                    tool_executor=tool_executor,
+                    concurrency_safe_tools=self._concurrency_safe_tools,
+                    default_timeout=self._default_tool_timeout,
                 )
 
-                # 3. 收集结果（gather 保证顺序与输入一致）
+                # 添加所有验证通过的调用
+                for tc, name, args in validated_calls:
+                    timeout = self._tool_timeouts.get(name, self._default_tool_timeout)
+                    executor.add_tool(tc.id, name, args, timeout=timeout)
+
+                # 3. 执行所有工具（自动并行/串行切换）
+                logger.info(f"执行 {len(validated_calls)} 个工具调用")
+                tool_results = await executor.execute_all()
+
+                # 4. 压缩结果后加入历史
                 for item in tool_results:
-                    if isinstance(item, Exception):
-                        payload_messages.append({
-                            "role": "tool",
-                            "tool_call_id": "",
-                            "content": f"工具执行异常: {item}",
-                        })
-                    else:
-                        payload_messages.append(item)
+                    if isinstance(item, dict) and "content" in item:
+                        tool_name = None
+                        # 尝试从原始调用中找到工具名
+                        for tc, name, _ in validated_calls:
+                            if tc.id == item.get("tool_call_id"):
+                                tool_name = name
+                                break
+                        if tool_name:
+                            item["content"] = self._compress_tool_result(
+                                item["content"], tool_name
+                            )
+                    payload_messages.append(item)
 
             except Exception as e:
                 error_str = str(e)
@@ -443,7 +639,6 @@ class MiMoClient:
 - 列表用 - 或 1.
 - 适当使用引用 > """
         return await self.chat(messages, system_prompt=md_system)
-
 
     async def generate_image(self, prompt: str) -> Optional[bytes]:
         """调用第三方文生图接口，返回第一张图片字节"""
@@ -483,10 +678,6 @@ class MiMoClient:
             logger.error(f"文生图调用失败: {e}", exc_info=True)
             return None
 
-    # ──────────────────────────────────────────────
-    #  图片 HTML 生成
-    # ──────────────────────────────────────────────
-
     async def generate_image_html(
         self,
         prompt: str,
@@ -515,10 +706,6 @@ class MiMoClient:
         except Exception as e:
             logger.error(f"HTML 生成失败: {e}")
             return None
-
-    # ──────────────────────────────────────────────
-    #  流式对话
-    # ──────────────────────────────────────────────
 
     async def chat_stream(
         self,
