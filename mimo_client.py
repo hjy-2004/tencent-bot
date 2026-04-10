@@ -772,6 +772,21 @@ class MiMoClient:
 
                 # ========== 工具执行（参考 CC：不做 JSON 预验证，让 tool 自然报错）==========
 
+                # ⚡ 硬拦截：同文件连续写操作检测（第 3 次时阻止）
+                blocked_calls: list[tuple] = []  # [(tc_id, name, reason), ...]
+                if len(recent_edits) >= 3:
+                    paths = [p for p, _ in recent_edits[-3:]]
+                    if len(set(paths)) == 1:
+                        # 阻止本次所有写操作
+                        for tc in message.tool_calls:
+                            if _is_write_tool(tc.function.name):
+                                blocked_calls.append((
+                                    tc.id,
+                                    tc.function.name,
+                                    f"已连续 3 次编辑同一文件 ({paths[0]})，已阻止本次操作。"
+                                ))
+                        logger.warning(f"同文件连续编辑检测触发，阻止 {len(blocked_calls)} 个写操作")
+
                 # 创建流式执行器（并发安全工具并行执行）
                 executor = StreamingToolExecutor(
                     tool_executor=tool_executor,
@@ -782,6 +797,9 @@ class MiMoClient:
                 # 添加所有工具调用（不预验证 JSON，让执行时自然报错）
                 for tc in message.tool_calls:
                     name = tc.function.name
+                    # 跳过被阻止的写操作
+                    if any(bc[0] == tc.id for bc in blocked_calls):
+                        continue
                     try:
                         args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError:
@@ -794,7 +812,16 @@ class MiMoClient:
                 logger.info(f"执行 {len(message.tool_calls)} 个工具调用")
                 tool_results = await executor.execute_all()
 
-                # 4. 压缩结果后加入历史
+                # 4. 加入被阻止的结果（硬拦截）
+                for tc_id, name, reason in blocked_calls:
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": reason,
+                        "is_error": True,
+                    })
+
+                # 5. 压缩结果后加入历史
                 for item in tool_results:
                     if isinstance(item, dict) and "content" in item:
                         tool_name = None
@@ -809,7 +836,7 @@ class MiMoClient:
                             )
                     payload_messages.append(item)
 
-                # ⚡ 同文件连续编辑检测
+                # ⚡ 同文件连续编辑检测 - 更新计数器
                 if _is_write_tool(tool_name or ""):
                     # 从结果中提取路径
                     content = item.get("content", "") if isinstance(item, dict) else ""
@@ -821,20 +848,9 @@ class MiMoClient:
                             recent_edits.append((path, tool_name or ""))
                             break
 
-                # 超过阈值，插入警告
-                if len(recent_edits) >= 3:
-                    paths = [p for p, _ in recent_edits[-3:]]
-                    if len(set(paths)) == 1:
-                        warning = (
-                            f"[系统提示] 你已连续 3 次编辑同一文件 ({paths[0]})。"
-                            f"请确认修改是否已完成？如已完成请返回最终结果，"
-                            f"不要再继续调用 fs_edit/fs_touch/fs_mkdir 等写操作工具。"
-                        )
-                        payload_messages.append({
-                            "role": "system",
-                            "content": warning,
-                        })
-                        recent_edits.clear()  # 清空，避免重复警告
+                # 硬拦截后，重置计数器（允许后续不同文件的编辑）
+                if blocked_calls:
+                    recent_edits.clear()
 
             except Exception as e:
                 error_str = str(e)
