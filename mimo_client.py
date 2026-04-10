@@ -88,7 +88,22 @@ def should_pre_compact(messages: list[dict], max_tokens: int = MAX_CONTEXT_TOKEN
     return total >= max_tokens * 0.8
 
 
-# ==================== 重试机制 ====================
+# ==================== JSON 错误解析 ====================
+
+def _parse_json_error(error: json.JSONDecodeError, raw_args: str) -> str:
+    msg = str(error.msg)
+    pos = error.pos
+    if "Unterminated string" in msg:
+        snippet = repr(raw_args[max(0, pos-20):pos+20])
+        return (f"Unterminated string. Pos: line {error.lineno} col {error.colno} char {pos}. "
+                f"Check: (1) quotes not closed, (2) backslash not escaped (C:\\test), (3) newlines. "
+                f"Snippet: {snippet}")
+    elif "Expecting" in msg:
+        return (f"JSON syntax error: {msg}. Pos: line {error.lineno} col {error.colno}. "
+                f"Check: (1) missing comma, (2) key without quotes, (3) trailing comma.")
+    else:
+        return f"JSON error: {msg} at line {error.lineno} col {error.colno}"
+
 
 def _is_retryable_error(error: Exception) -> bool:
     """判断错误是否可重试"""
@@ -718,14 +733,16 @@ class MiMoClient:
                         validated_calls.append((tc, name, args))
                     except json.JSONDecodeError as e:
                         logger.warning(f"工具 {name} 参数 JSON 解析失败: {e}")
-                        invalid_calls.append((tc.id, name, str(e)))
+                        # 生成更具体的错误提示，帮助 LLM 修正
+                        err_detail = _parse_json_error(e, tc.function.arguments)
+                        invalid_calls.append((tc.id, name, err_detail))
 
                 # 立即返回 JSON 解析失败的错误（不执行工具）
-                for tc_id, name, err in invalid_calls:
+                for tc_id, name, err_detail in invalid_calls:
                     payload_messages.append({
                         "role": "tool",
                         "tool_call_id": tc_id,
-                        "content": f"参数错误：JSON 解析失败 ({err})，请检查参数格式。",
+                        "content": f"参数错误：JSON 解析失败。{err_detail}\n\n请使用正确的 JSON 格式，例如：{{\"path\": \"C:\\\\\\\\test\\\\\\\\file.txt\", \"content\": \"文件内容\"}}",
                         "is_error": True,
                     })
 
